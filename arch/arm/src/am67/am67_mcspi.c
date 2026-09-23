@@ -36,6 +36,7 @@
 #include <nuttx/arch.h>
 #include <nuttx/mutex.h>
 #include <nuttx/spi/spi.h>
+#include <syslog.h>
 
 #include "am67_mcspi.h"
 #include "am67_pinmux.h"
@@ -328,6 +329,96 @@ static void am67_mcspi_apply_hwconfig(FAR struct am67_mcspi_dev_s *priv)
     }
 }
 
+static void am67_mcspi_log_cs1_once(FAR struct am67_mcspi_dev_s *priv)
+{
+  static int logged = 0;
+  static const struct
+  {
+    const char *name;
+    uint32_t offset;
+  } pads[] =
+  {
+    { "clk",    PIN_MCU_SPI0_CLK },
+    { "d0",     PIN_MCU_SPI0_D0 },
+    { "d1",     PIN_MCU_SPI0_D1 },
+    { "cs0",    PIN_MCU_SPI0_CS0 },
+    { "cs1",    PIN_MCU_SPI0_CS1 },
+    { "cs3",    PIN_MCU_MCAN0_TX },
+    { "imu_en", PIN_WKUP_UART0_RTSN },
+  };
+  unsigned int i;
+
+  if (logged != 0)
+    {
+      return;
+    }
+
+  logged = 1;
+
+  syslog(LOG_ERR,
+         "[mcspi] base=0x%08" PRIx32 " rev=0x%08" PRIx32
+         " sysstatus=0x%08" PRIx32 " modulctrl=0x%08" PRIx32 "\n",
+         priv->base,
+         am67_mcspi_getreg(priv->base, AM67_MCSPI_REVISION),
+         am67_mcspi_getreg(priv->base, AM67_MCSPI_SYSSTATUS),
+         am67_mcspi_getreg(priv->base, AM67_MCSPI_MODULCTRL));
+
+  for (i = 0; i < 4u; i++)
+    {
+      const uint32_t off = AM67_MCSPI_CHCONF0 + AM67_MCSPI_CH_OFFSET(i);
+
+      syslog(LOG_ERR, "[mcspi] ch%u chconf@0x%03" PRIx32 "=0x%08" PRIx32 "\n",
+             i, off, am67_mcspi_getreg(priv->base, off));
+    }
+
+  for (i = 0; i < (sizeof(pads) / sizeof(pads[0])); i++)
+    {
+      const uint32_t addr = CSL_MCU_PADCFG_CTRL0_CFG0_BASE +
+                            PADCFG_PMUX_OFFSET + pads[i].offset;
+
+      syslog(LOG_ERR, "[pad] %s off=0x%04" PRIx32 " val=0x%08" PRIx32 "\n",
+             pads[i].name, pads[i].offset, getreg32(addr));
+    }
+}
+
+static void am67_mcspi_clear_other_force(FAR struct am67_mcspi_dev_s *priv,
+                                        uint8_t keep)
+{
+  uint8_t ch;
+
+  /* SINGLE=1 allows FORCE on only one channel. Clearing CHCTRL.EN on
+   * the channel we leave does not clear its FORCE bit, so that CS can
+   * stay asserted while the new channel is selected.
+   */
+
+  for (ch = 0; ch < 4u; ch++)
+    {
+      uint32_t off;
+      uint32_t conf;
+
+      if (ch == keep)
+        {
+          continue;
+        }
+
+      off = AM67_MCSPI_CHCONF0 + AM67_MCSPI_CH_OFFSET(ch);
+      conf = am67_mcspi_getreg(priv->base, off);
+
+      if ((conf & AM67_MCSPI_CHCONF_FORCE) == 0)
+        {
+          continue;
+        }
+
+      conf &= ~AM67_MCSPI_CHCONF_FORCE;
+      am67_mcspi_putreg(priv->base, off, conf);
+
+      if (ch == priv->channel)
+        {
+          priv->chconf &= ~AM67_MCSPI_CHCONF_FORCE;
+        }
+    }
+}
+
 static void am67_mcspi_select_channel(FAR struct am67_mcspi_dev_s *priv,
                                       uint8_t channel)
 {
@@ -385,24 +476,86 @@ static uint32_t am67_mcspi_transfer_word(FAR struct am67_mcspi_dev_s *priv,
                                          uint32_t wd)
 {
   uint32_t choff = AM67_MCSPI_CH_OFFSET(priv->channel);
+  const bool txs = am67_mcspi_waitstat(priv->base, priv->channel,
+                                       AM67_MCSPI_CHSTAT_TXS);
 
-  if (!am67_mcspi_waitstat(priv->base, priv->channel,
-                           AM67_MCSPI_CHSTAT_TXS))
+  if (!txs)
     {
+      if (priv->channel == 1)
+        {
+          static int logged = 0;
+
+          if (logged == 0)
+            {
+              logged = 1;
+              syslog(LOG_ERR, "[mcspi] ch1 word txs=0 rxs=0 rx=0x00000000\n");
+            }
+        }
+
       spierr("ERROR: TX timeout ch%u\n", priv->channel);
       return 0;
     }
 
   am67_mcspi_putreg(priv->base, AM67_MCSPI_TX0 + choff, wd);
 
-  if (!am67_mcspi_waitstat(priv->base, priv->channel,
-                           AM67_MCSPI_CHSTAT_RXS))
+  const bool rxs = am67_mcspi_waitstat(priv->base, priv->channel,
+                                       AM67_MCSPI_CHSTAT_RXS);
+  const uint32_t rd = rxs ? am67_mcspi_getreg(priv->base, AM67_MCSPI_RX0 + choff) : 0;
+
+  /* Two full RX words for WHO_AM_I (0x8F) and a second pass of CTRL_REG2
+   * (0x91) and STATUS (0xA7). The low 8 bits are what the driver keeps.
+   */
+  if (priv->channel == 1)
+    {
+      static int n8f = 0;
+      static int n91 = 0;
+      static int na7 = 0;
+      static int follow = 0;
+      static uint32_t follow_cmd = 0;
+      int take = 0;
+
+      if (follow != 0)
+        {
+          syslog(LOG_ERR,
+                 "[mcspi] ch1 rx32 cmd=0x%02" PRIx32
+                 " phase=data txs=1 rxs=%d rx=0x%08" PRIx32 "\n",
+                 follow_cmd, rxs ? 1 : 0, rd);
+          follow = 0;
+        }
+      else if (wd == 0x8fu && n8f < 2)
+        {
+          n8f++;
+          take = 1;
+        }
+      else if (wd == 0x91u && n91 < 2)
+        {
+          n91++;
+          take = 1;
+        }
+      else if (wd == 0xa7u && na7 < 2)
+        {
+          na7++;
+          take = 1;
+        }
+
+      if (take != 0)
+        {
+          syslog(LOG_ERR,
+                 "[mcspi] ch1 rx32 cmd=0x%02" PRIx32
+                 " phase=cmd txs=1 rxs=%d rx=0x%08" PRIx32 "\n",
+                 wd, rxs ? 1 : 0, rd);
+          follow = 1;
+          follow_cmd = wd;
+        }
+    }
+
+  if (!rxs)
     {
       spierr("ERROR: RX timeout ch%u\n", priv->channel);
       return 0;
     }
 
-  return am67_mcspi_getreg(priv->base, AM67_MCSPI_RX0 + choff);
+  return rd;
 }
 
 /****************************************************************************
@@ -540,9 +693,15 @@ void am67_mcspi_board_select(FAR struct spi_dev_s *dev, uint8_t channel,
 
   if (selected)
     {
+      am67_mcspi_clear_other_force(priv, channel);
       am67_mcspi_select_channel(priv, channel);
       am67_mcspi_cs_force(priv, false);
       priv->selected = true;
+
+      if (channel == 1)
+        {
+          am67_mcspi_log_cs1_once(priv);
+        }
     }
   else
     {
