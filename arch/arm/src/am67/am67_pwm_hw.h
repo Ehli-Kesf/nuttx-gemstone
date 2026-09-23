@@ -118,6 +118,8 @@
 
 #define AM67_EPWM_AQCTLA_ZRO_SHIFT                      (0)
 #define AM67_EPWM_AQCTLA_ZRO_MASK                       (3u << 0)
+#define AM67_EPWM_AQCTLA_PRD_SHIFT                      (2)
+#define AM67_EPWM_AQCTLA_PRD_MASK                       (3u << 2)
 #define AM67_EPWM_AQCTLA_CAU_SHIFT                      (4)
 #define AM67_EPWM_AQCTLA_CAU_MASK                       (3u << 4)
 
@@ -127,6 +129,8 @@
 
 #define AM67_EPWM_AQCTLB_ZRO_SHIFT                      (0)
 #define AM67_EPWM_AQCTLB_ZRO_MASK                       (3u << 0)
+#define AM67_EPWM_AQCTLB_PRD_SHIFT                      (2)
+#define AM67_EPWM_AQCTLB_PRD_MASK                       (3u << 2)
 #define AM67_EPWM_AQCTLB_CBU_SHIFT                      (8)
 #define AM67_EPWM_AQCTLB_CBU_MASK                       (3u << 8)
 

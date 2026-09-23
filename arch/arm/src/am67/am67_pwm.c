@@ -366,31 +366,31 @@ static int am67_epwm_check_pid(uint32_t base)
  * Name: am67_epwm_config_aqctl
  *
  * Description:
- *   Program the action qualifier for one output: SET at counter zero,
- *   CLEAR at that output's own compare event on the way up (CAU/CMPA
- *   for channel 1, CBU/CMPB for channel 2).  Up-count asymmetric
- *   recipe: duty is proportional to the compare value.
+ *   High from the start of the period until the compare match. SET on
+ *   zero and again on period (the zero event alone left the pin low),
+ *   CLEAR on this channel's up-count compare. Full write: a read-modify
+ *   would keep stale actions from an earlier probe.
  *
  ****************************************************************************/
 
 static void am67_epwm_config_aqctl(uint32_t base, int8_t channel)
 {
-  uint32_t offset = (channel == 1) ? AM67_EPWM_AQCTLA_OFFSET
-                                   : AM67_EPWM_AQCTLB_OFFSET;
-  uint16_t regval = am67_epwm_getreg16(base, offset);
+  uint16_t regval;
 
   if (channel == 1)
     {
-      regval |= (AM67_EPWM_AQ_SET << AM67_EPWM_AQCTLA_ZRO_SHIFT);
+      regval  = (AM67_EPWM_AQ_SET << AM67_EPWM_AQCTLA_ZRO_SHIFT);
+      regval |= (AM67_EPWM_AQ_SET << AM67_EPWM_AQCTLA_PRD_SHIFT);
       regval |= (AM67_EPWM_AQ_CLEAR << AM67_EPWM_AQCTLA_CAU_SHIFT);
+      am67_epwm_putreg16(base, AM67_EPWM_AQCTLA_OFFSET, regval);
     }
   else
     {
-      regval |= (AM67_EPWM_AQ_SET << AM67_EPWM_AQCTLB_ZRO_SHIFT);
+      regval  = (AM67_EPWM_AQ_SET << AM67_EPWM_AQCTLB_ZRO_SHIFT);
+      regval |= (AM67_EPWM_AQ_SET << AM67_EPWM_AQCTLB_PRD_SHIFT);
       regval |= (AM67_EPWM_AQ_CLEAR << AM67_EPWM_AQCTLB_CBU_SHIFT);
+      am67_epwm_putreg16(base, AM67_EPWM_AQCTLB_OFFSET, regval);
     }
-
-  am67_epwm_putreg16(base, offset, regval);
 }
 
 /****************************************************************************
@@ -406,20 +406,8 @@ static void am67_epwm_clear_aqctl(uint32_t base, int8_t channel)
 {
   uint32_t offset = (channel == 1) ? AM67_EPWM_AQCTLA_OFFSET
                                    : AM67_EPWM_AQCTLB_OFFSET;
-  uint16_t regval = am67_epwm_getreg16(base, offset);
 
-  if (channel == 1)
-    {
-      regval &= ~AM67_EPWM_AQCTLA_ZRO_MASK;
-      regval &= ~AM67_EPWM_AQCTLA_CAU_MASK;
-    }
-  else
-    {
-      regval &= ~AM67_EPWM_AQCTLB_ZRO_MASK;
-      regval &= ~AM67_EPWM_AQCTLB_CBU_MASK;
-    }
-
-  am67_epwm_putreg16(base, offset, regval);
+  am67_epwm_putreg16(base, offset, 0u);
 }
 
 /****************************************************************************
@@ -534,11 +522,9 @@ static void am67_epwm_set_tbctl(uint32_t base)
  * Name: am67_epwm_set_cmpctl
  *
  * Description:
- *   Configure counter-compare for both channels: CMPA and CMPB shadowed
- *   (SHDWxMODE=0), shadows loaded into the active registers on the PRD
- *   event (LOADxMODE=1) so a duty update never races the SET action at
- *   counter zero.  Per-module policy: both channels' compares behave
- *   identically whether or not channel B is in use.
+ *   Write CMPA/CMPB straight into the active registers (SHDWxMODE=1).
+ *   Shadow load on PRD left the active compare at 0, so the pin stayed
+ *   low while a forced-high output on the same pad reached the header.
  *
  ****************************************************************************/
 
@@ -546,8 +532,8 @@ static void am67_epwm_set_cmpctl(uint32_t base)
 {
   uint16_t regval = 0u;
 
-  regval |= (1u << AM67_EPWM_CMPCTL_LOADAMODE_SHIFT);
-  regval |= (1u << AM67_EPWM_CMPCTL_LOADBMODE_SHIFT);
+  regval |= AM67_EPWM_CMPCTL_SHDWAMODE_IMMEDIATE;
+  regval |= AM67_EPWM_CMPCTL_SHDWBMODE_IMMEDIATE;
 
   am67_epwm_putreg16(base, AM67_EPWM_CMPCTL_OFFSET, regval);
 }
@@ -976,21 +962,17 @@ static int am67_epwm_start(struct pwm_lowerhalf_s *dev,
           return ret;
         }
 
-      /* Commit: nothing below can fail (void register writes only),
-       * and set_duty derives the compare from priv->tbprd, so priv
-       * must be current before the writes begin.
-       */
-
-      priv->frequency = info->frequency;
-      priv->tbprd     = tbprd;
-
-      /* Stop-first: parks both pins and empties the active set, which
-       * makes every requested channel a joiner below - the frequency
-       * change re-ignites through the same join mechanism as a fresh
-       * start.
+      /* stop() parks the pins and clears priv->frequency. Do that
+       * before publishing the new rate: publishing first made the next
+       * start() see frequency 0 and park the outputs on every update.
        */
 
       am67_epwm_stop(dev);
+
+      /* set_duty derives the compare from priv->tbprd. */
+      priv->frequency = info->frequency;
+      priv->tbprd     = tbprd;
+
       am67_epwm_set_clock_values(priv->base, hsp, clk, tbprd);
       am67_epwm_reset_tbcnt(priv->base);
     }
