@@ -366,10 +366,10 @@ static int am67_epwm_check_pid(uint32_t base)
  * Name: am67_epwm_config_aqctl
  *
  * Description:
- *   High from the start of the period until the compare match. SET on
- *   zero and again on period (the zero event alone left the pin low),
- *   CLEAR on this channel's up-count compare. Full write: a read-modify
- *   would keep stale actions from an earlier probe.
+ *   High from the start of the period until the up-count compare: SET
+ *   on zero and on period, CLEAR on this channel's compare. The period
+ *   SET is one timebase tick at the end of the low interval. Full write
+ *   so a read-modify cannot keep stale actions.
  *
  ****************************************************************************/
 
@@ -768,11 +768,10 @@ static void am67_epwm_set_clock_values(uint32_t base, uint16_t hsp,
  * Description:
  *   Convert the ub16 duty fraction to compare ticks and write it to the
  *   given channel's compare register (CMPA for channel 1, CMPB for
- *   channel 2).  The write lands in the shadow register and loads at
- *   the next PRD event (glitch-free live update).  Worst case product
- *   is 65535 * 65536 < 2^32: no overflow in 32-bit math.  duty = 0
- *   gives exact 0% (compare outranks zero in AQ priority); exact 100%
- *   is unreachable by the ub16 format itself (max 65535/65536).
+ *   channel 2).  CMPCTL is immediate, so the write updates the active
+ *   compare and does not wait for a period event.  duty = 0 gives exact
+ *   0% (compare outranks zero in AQ priority); exact 100% is unreachable
+ *   by the ub16 format itself (max 65535/65536).
  *
  ****************************************************************************/
 
