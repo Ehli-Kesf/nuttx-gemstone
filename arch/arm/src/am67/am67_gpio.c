@@ -27,7 +27,6 @@
 #include <nuttx/config.h>
 #include <assert.h>
 #include <stdint.h>
-#include <syslog.h>
 
 #include "am67_gpio.h"
 #include "am67_pinmux.h"
@@ -297,16 +296,6 @@ bool am67_gpioread(am67_gpio_t gpio)
 
 void am67_sensors_power_enable(bool enable)
 {
-  const struct am67_gpio_desc_s *desc;
-  bool electrical;
-  bool logical;
-
   am67_configgpio(AM67_GPIO_MCU0_PIN12, GPIO_OUTPUT);
   am67_gpiowrite(AM67_GPIO_MCU0_PIN12, enable);
-
-  desc = am67_gpio_desc(AM67_GPIO_MCU0_PIN12);
-  electrical = gpio_read_level(desc->base, desc->pin);
-  logical = am67_gpioread(AM67_GPIO_MCU0_PIN12);
-  syslog(LOG_ERR, "[gpio] IMU_EN enable=%d electrical=%d logical=%d\n",
-         enable ? 1 : 0, electrical ? 1 : 0, logical ? 1 : 0);
 }

@@ -71,6 +71,7 @@
 #define AM67_MCSPI_TX0             0x138
 #define AM67_MCSPI_RX0             0x13c
 
+#define AM67_MCSPI_NCHANNELS       4u
 #define AM67_MCSPI_CH_OFFSET(n)    ((uint32_t)(n) * 0x14u)
 
 #define AM67_MCSPI_SYSCONFIG_AUTOIDLE           (1u << 0)
