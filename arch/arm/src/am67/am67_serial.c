@@ -38,6 +38,9 @@
  * Pre-processor definitions
  ****************************************************************************/
 
+#define AM67_UART_MDR1_OFFSET  0x20   /* MDR1: 0 = UART 16x, 7 = disabled */
+#define AM67_TISCI_DEV_UART6   158u   /* J722S TISCI device ID, MAIN_UART6 */
+
 #if defined(USE_SERIALDRIVER) /* && defined(HAVE_UART_DEVICE)*/
 
 /****************************************************************************
@@ -66,12 +69,40 @@
 
 static void open_uart(void)
 {
-  putreg32(0, CONFIG_16550_UART0_BASE + 0x20);
+  putreg32(0, CONFIG_16550_UART0_BASE + AM67_UART_MDR1_OFFSET);
 }
 
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
+
+#ifdef CONFIG_16550_UART1
+int am67_tisci_device_on(uint32_t id);
+
+/****************************************************************************
+ * Name: am67_uart6_enable
+ *
+ * Description:
+ *   Power MAIN_UART6 (NuttX UART1) through the DMSC and put it in UART 16x
+ *   mode. The px4-r5f overlay keeps Linux off this UART, so nobody else
+ *   turns it on, and MDR1 resets to 0x7 (disabled). Must run before the
+ *   port is opened.
+ *
+ ****************************************************************************/
+
+int am67_uart6_enable(void)
+{
+  int ret = am67_tisci_device_on(AM67_TISCI_DEV_UART6);
+
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  putreg32(0, CONFIG_16550_UART1_BASE + AM67_UART_MDR1_OFFSET);
+  return 0;
+}
+#endif
 
 /****************************************************************************
  * Name: arm_serialinit

@@ -192,6 +192,6 @@ int am67_tisci_device_on(uint32_t id)
       return -EIO;
     }
 
-  syslog(LOG_ERR, "tisci dev %" PRIu32 " on: ack\n", id);
+  syslog(LOG_INFO, "tisci dev %" PRIu32 " on: ack\n", id);
   return 0;
 }

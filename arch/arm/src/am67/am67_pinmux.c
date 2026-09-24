@@ -50,15 +50,20 @@ static struct pinmux_conf_s g_am67_pinmux_conf[] =
     (PIN_MODE(2) | PIN_PULL_DISABLE)
   },
 
-#if 0  /* console bisect: MAIN6 UART pads disabled */
-  /* UART-MAIN6 RX */
+#ifdef CONFIG_16550_UART1
+  /* MAIN_UART6 (NuttX 16550 UART1, /dev/ttyS1): GPS on HAT 7/11.
+   * RX is pulled up so an unplugged GPS reads as an idle line instead of
+   * floating into framing errors.
+   */
+
+  /* UART6_RXD -> GPMC0_WAIT1 (W26), HAT 7 */
 
   {
     PIN_GPMC0_WAIT1,
-    (PIN_MODE(3) | PIN_INPUT_ENABLE | PIN_PULL_DISABLE)
+    (PIN_MODE(3) | PIN_INPUT_ENABLE | PIN_PULL_DIRECTION)
   },
 
-  /* UART-MAIN6 TX */
+  /* UART6_TXD -> MCASP0_AXR2 (A26), HAT 11 */
 
   {
     PIN_MCASP0_AXR2,
