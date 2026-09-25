@@ -33,6 +33,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <nuttx/panic_notifier.h>
 #include <nuttx/timers/pwm.h>
 
 #include "arm_internal.h"
@@ -62,6 +63,8 @@
 /* EPWM time-base clock gate (CTRL_MMR partition 1) */
 
 #define AM67_CTRL_MMR_EPWM_TB_CLKEN       0x4130      /* Offset from base */
+#define AM67_CTRL_MMR_EPWM_CTRL(n)        (0x4140 + 4 * (n))   /* EPWMn_CTRL */
+#define AM67_CTRL_MMR_EPWM_CTRL_EALLOW    (1u << 4)   /* trip-zone write enable */
 #define AM67_EPWM_TB_CLKEN_EPWM0_EN       (1u << 0)
 #define AM67_EPWM_TB_CLKEN_EPWM1_EN       (1u << 1)
 #define AM67_EPWM_TB_CLKEN_EPWM2_EN       (1u << 2)
@@ -112,6 +115,7 @@ struct am67_epwm_s
   uint16_t tbprd;
   uint8_t active_channels;
   uint8_t pinmux_id;        /* Instance number for pad muxing */
+  volatile bool live;       /* setup() done: module powered and clocked */
 };
 
 /****************************************************************************
@@ -127,6 +131,8 @@ static int am67_epwm_start(struct pwm_lowerhalf_s *dev,
 static int am67_epwm_stop(struct pwm_lowerhalf_s *dev);
 static int am67_epwm_ioctl(struct pwm_lowerhalf_s *dev,
                            int cmd, unsigned long arg);
+static int am67_epwm_panic(FAR struct notifier_block *nb,
+                           unsigned long action, FAR void *data);
 
 /****************************************************************************
  * Private Data
@@ -823,10 +829,38 @@ static int am67_epwm_setup(struct pwm_lowerhalf_s *dev)
       return ret;
     }
 
+  /* The trip-zone registers ignore writes until CTRL_MMR EPWMn_CTRL
+   * EALLOW is set. Leave it set so the emergency stop can force a trip.
+   */
+
+  am67_epwm_putreg(AM67_MAIN_CTRL_MMR_BASE,
+                   AM67_CTRL_MMR_EPWM_CTRL(priv->pinmux_id),
+                   am67_epwm_getreg(AM67_MAIN_CTRL_MMR_BASE,
+                                    AM67_CTRL_MMR_EPWM_CTRL(priv->pinmux_id)) |
+                   AM67_CTRL_MMR_EPWM_CTRL_EALLOW);
+
+  /* Force-low is the trip action. Clear a trip left latched by a crashed
+   * image: the module keeps its state across an R5F reload, and a latched
+   * one-shot trip would hold every output low.
+   */
+
+  am67_epwm_putreg16(priv->base, AM67_EPWM_TZCTL_OFFSET,
+                     AM67_EPWM_TZCTL_TZA_LOW | AM67_EPWM_TZCTL_TZB_LOW);
+  am67_epwm_putreg16(priv->base, AM67_EPWM_TZCLR_OFFSET,
+                     AM67_EPWM_TZ_OST | AM67_EPWM_TZ_CBC | AM67_EPWM_TZ_INT);
+
+  if (am67_epwm_getreg16(priv->base, AM67_EPWM_TZCTL_OFFSET) !=
+      (AM67_EPWM_TZCTL_TZA_LOW | AM67_EPWM_TZCTL_TZB_LOW))
+    {
+      pwmerr("ERROR: EPWM%u trip-zone not writable\n", priv->pinmux_id);
+      return -EIO;
+    }
+
   am67_epwm_pinmux_init(priv->pinmux_id);
   am67_epwm_set_cmpctl(priv->base);
   am67_epwm_set_tbctl(priv->base);
 
+  priv->live = true;
   return OK;
 }
 
@@ -1171,7 +1205,62 @@ struct pwm_lowerhalf_s *am67_epwminitialize(int pwm)
 
 int am67_epwm_init(void)
 {
+  static struct notifier_block nb =
+  {
+    .notifier_call = am67_epwm_panic,
+  };
+
+  static bool registered;
+
+  if (!registered)
+    {
+      registered = true;
+      panic_notifier_chain_register(&nb);
+    }
+
   return am67_epwm_enable_register_write();
+}
+
+/****************************************************************************
+ * Name: am67_epwm_emergency_stop
+ *
+ * Description:
+ *   Drive every EPWM output that has been set up low at once, with a
+ *   one-shot trip. Register writes only: safe from an assert, an
+ *   exception handler or an ISR. The trip stays latched until the next
+ *   setup().
+ *
+ ****************************************************************************/
+
+void am67_epwm_emergency_stop(void)
+{
+#ifdef CONFIG_AM67_EPWM0
+  if (g_am67_epwm0.live)
+    {
+      am67_epwm_putreg16(g_am67_epwm0.base, AM67_EPWM_TZFRC_OFFSET,
+                         AM67_EPWM_TZ_OST);
+    }
+#endif
+
+#ifdef CONFIG_AM67_EPWM1
+  if (g_am67_epwm1.live)
+    {
+      am67_epwm_putreg16(g_am67_epwm1.base, AM67_EPWM_TZFRC_OFFSET,
+                         AM67_EPWM_TZ_OST);
+    }
+#endif
+}
+
+/* Any assertion or CPU exception: a flight task may be dead, so do not
+ * leave the motors on their last command. The ESCs see the signal go
+ * low and stop.
+ */
+
+static int am67_epwm_panic(FAR struct notifier_block *nb,
+                           unsigned long action, FAR void *data)
+{
+  am67_epwm_emergency_stop();
+  return 0;
 }
 
 #endif /* CONFIG_AM67_EPWM0 || CONFIG_AM67_EPWM1 */

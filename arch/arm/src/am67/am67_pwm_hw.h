@@ -71,6 +71,15 @@
 /* CC module */
 
 #define AM67_EPWM_CMPCTL_OFFSET         0x00e
+#define AM67_EPWM_TZCTL_OFFSET          0x028   /* trip action, 2 = low  */
+#define AM67_EPWM_TZCLR_OFFSET          0x02e   /* write 1 to clear      */
+#define AM67_EPWM_TZFRC_OFFSET          0x030   /* write 1 to force trip */
+
+#define AM67_EPWM_TZCTL_TZA_LOW         (2u << 0)
+#define AM67_EPWM_TZCTL_TZB_LOW         (2u << 2)
+#define AM67_EPWM_TZ_INT                (1u << 0)
+#define AM67_EPWM_TZ_CBC                (1u << 1)
+#define AM67_EPWM_TZ_OST                (1u << 2)
 #define AM67_EPWM_CMPA_OFFSET           0x012
 #define AM67_EPWM_CMPB_OFFSET           0x014
 
