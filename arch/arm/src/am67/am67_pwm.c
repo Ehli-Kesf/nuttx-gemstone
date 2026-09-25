@@ -522,20 +522,26 @@ static void am67_epwm_set_tbctl(uint32_t base)
  * Name: am67_epwm_set_cmpctl
  *
  * Description:
- *   Write CMPA/CMPB straight into the active registers (SHDWxMODE=1).
- *   Shadow load on PRD left the active compare at 0, so the pin stayed
- *   low while a forced-high output on the same pad reached the header.
+ *   Shadow CMPA/CMPB (SHDWxMODE=0) and load them at CTR=0 (LOADxMODE=0),
+ *   the start of each pulse.
+ *
+ *   An immediate write can land after the counter has passed the new
+ *   compare but not the old one. The CLEAR for that period is then
+ *   missed, the output stays high into the next period, and the ESC sees
+ *   one pulse longer than the period (> 2.5 ms at 400 Hz) when the
+ *   throttle is lowered. With the load at CTR=0 each period uses one
+ *   compare value from start to end. A new duty takes effect at the next
+ *   period, at most one period late.
  *
  ****************************************************************************/
 
 static void am67_epwm_set_cmpctl(uint32_t base)
 {
-  uint16_t regval = 0u;
+  /* SHDWAMODE = SHDWBMODE = 0 (shadowed), LOADAMODE = LOADBMODE = 0
+   * (load on CTR = 0).
+   */
 
-  regval |= AM67_EPWM_CMPCTL_SHDWAMODE_IMMEDIATE;
-  regval |= AM67_EPWM_CMPCTL_SHDWBMODE_IMMEDIATE;
-
-  am67_epwm_putreg16(base, AM67_EPWM_CMPCTL_OFFSET, regval);
+  am67_epwm_putreg16(base, AM67_EPWM_CMPCTL_OFFSET, 0u);
 }
 
 /****************************************************************************
@@ -768,8 +774,8 @@ static void am67_epwm_set_clock_values(uint32_t base, uint16_t hsp,
  * Description:
  *   Convert the ub16 duty fraction to compare ticks and write it to the
  *   given channel's compare register (CMPA for channel 1, CMPB for
- *   channel 2).  CMPCTL is immediate, so the write updates the active
- *   compare and does not wait for a period event.  duty = 0 gives exact
+ *   channel 2).  The write goes to the shadow register and becomes active
+ *   at the next CTR=0 (see am67_epwm_set_cmpctl).  duty = 0 gives exact
  *   0% (compare outranks zero in AQ priority); exact 100% is unreachable
  *   by the ub16 format itself (max 65535/65536).
  *
