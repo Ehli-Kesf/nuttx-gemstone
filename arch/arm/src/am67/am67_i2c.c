@@ -157,6 +157,7 @@ struct am67_trace_s
 struct am67_i2c_config_s
 {
   uint32_t base;              /* I2C base address */
+  uint32_t tisci_dev;         /* TISCI device to power on first, 0 = none */
   uint8_t mode;               /* Master or Slave mode */
 #ifndef CONFIG_I2C_POLLED
   uint32_t irq;               /* Event IRQ */
@@ -248,6 +249,7 @@ static int am67_i2c_isr(int irq, void *context, void *arg);
 #endif /* !CONFIG_I2C_POLLED */
 
 static int am67_i2c_init(struct am67_i2c_priv_s *priv);
+int am67_tisci_device_on(uint32_t id);
 static int am67_i2c_deinit(struct am67_i2c_priv_s *priv);
 static int am67_i2c_transfer(struct i2c_master_s *dev,
                                struct i2c_msg_s *msgs, int count);
@@ -285,6 +287,7 @@ static const struct i2c_ops_s am67_i2c_ops =
 static const struct am67_i2c_config_s am67_i2c0_config =
 {
   .base       = AM67_I2C0_VADDR,
+  .tisci_dev  = 106,          /* J722S MCU_I2C0; Linux leaves it off */
 #ifndef CONFIG_I2C_SLAVE
   .mode       = I2C_MASTER,
 #else
@@ -1122,6 +1125,16 @@ static int am67_i2c_isr(int irq, void *context, void *arg)
 
 static int am67_i2c_init(struct am67_i2c_priv_s *priv)
 {
+  unsigned int spins;
+
+  /* A module nobody powered reads as zero and never reports RST_DONE. */
+
+  if (priv->config->tisci_dev != 0 &&
+      am67_tisci_device_on(priv->config->tisci_dev) < 0)
+    {
+      return -ENODEV;
+    }
+
   /* Configure pins */
 
   am67_i2c_pinmux_init();
@@ -1140,9 +1153,15 @@ static int am67_i2c_init(struct am67_i2c_priv_s *priv)
 
   am67_i2c_modifyreg(priv, AM67_I2C_CON_OFFSET, 0, I2C_CON_EN);
 
-  while (!(am67_i2c_getreg(priv, AM67_I2C_SYSS_OFFSET) &
-           I2C_SYSS_RST_DONE))
+  for (spins = 0; !(am67_i2c_getreg(priv, AM67_I2C_SYSS_OFFSET) &
+                    I2C_SYSS_RST_DONE); spins++)
     {
+      if (spins > 100000)
+        {
+          i2cerr("ERROR: I2C 0x%08" PRIx32 " reset timeout\n",
+                 priv->config->base);
+          return -ETIMEDOUT;
+        }
     }
 
   /* No-idle mode + keep both clocks active so the WKUP domain power
@@ -1253,7 +1272,14 @@ static int am67_i2c_transfer(struct i2c_master_s *dev,
 
   if (!priv->inited)
     {
-      am67_i2c_init(priv);
+      ret = am67_i2c_init(priv);
+
+      if (ret < 0)
+        {
+          nxmutex_unlock(&priv->lock);
+          return ret;
+        }
+
       priv->inited = true;
     }
 

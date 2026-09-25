@@ -210,18 +210,23 @@ static struct pinmux_conf_s g_am67_mcu_spi_pinmux_conf[] =
 static struct pinmux_conf_s g_am67_mcu_i2c_pinmux_conf[] =
 {
 #ifdef CONFIG_AM67_I2C0
-  /* MCU_I2C0_SCL */
+  /* MCU_I2C0 goes to HAT 3 (SDA) and HAT 5 (SCL) with no pull-ups on the
+   * board. Use the pad pull-ups, as Linux does, so an empty header reads
+   * as an idle bus; a module's own pull-ups add to them.
+   */
+
+  /* MCU_I2C0_SCL (B13), HAT 5 */
 
   {
     PIN_MCU_I2C0_SCL,
-    (PIN_MODE(0) | PIN_INPUT_ENABLE | PIN_PULL_DISABLE)
+    (PIN_MODE(0) | PIN_INPUT_ENABLE | PIN_PULL_DIRECTION)
   },
 
-  /* MCU_I2C0_SDA */
+  /* MCU_I2C0_SDA (E11), HAT 3 */
 
   {
     PIN_MCU_I2C0_SDA,
-    (PIN_MODE(0) | PIN_INPUT_ENABLE | PIN_PULL_DISABLE)
+    (PIN_MODE(0) | PIN_INPUT_ENABLE | PIN_PULL_DIRECTION)
   },
 #endif
 
