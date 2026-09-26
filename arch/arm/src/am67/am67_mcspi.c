@@ -30,6 +30,7 @@
 #include <debug.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -41,6 +42,7 @@
 #include "am67_mcspi.h"
 #include "am67_pinmux.h"
 #include "arm_internal.h"
+#include "sctlr.h"
 
 #ifdef CONFIG_AM67_MCSPI0
 
@@ -57,7 +59,22 @@ uint8_t am67_spi0status(FAR struct spi_dev_s *dev, uint32_t devid);
  ****************************************************************************/
 
 #define AM67_MCSPI_MAX_DIVIDER      4096u
-#define AM67_MCSPI_POLL_TIMEOUT     1000000u
+
+/* Longest wait for one status bit. One byte at the slowest clock in use
+ * (1 MHz) takes 8 us. Measured with the PMU cycle counter; the R5F runs at
+ * 800 MHz (799.93 MHz measured on the O1).
+ */
+
+#define AM67_MCSPI_CPU_HZ           800000000u
+#define AM67_MCSPI_TIMEOUT_US       100u
+#define AM67_MCSPI_TIMEOUT_CYCLES   (AM67_MCSPI_TIMEOUT_US * \
+                                     (AM67_MCSPI_CPU_HZ / 1000000u))
+
+/* Backstop in case the cycle counter ever stops: each poll is at least one
+ * MCU-domain register read, so this is well above the time limit.
+ */
+
+#define AM67_MCSPI_POLL_MAX         1000000u
 
 /****************************************************************************
  * Private Types
@@ -75,6 +92,8 @@ struct am67_mcspi_dev_s
   uint32_t         chconf;
   uint32_t         chctrl;
   bool             selected;
+  uint32_t         errors;     /* Failures since am67_mcspi_take_errors() */
+  uint32_t         reset_at;   /* errors when the controller was last reset */
 };
 
 /****************************************************************************
@@ -147,21 +166,28 @@ am67_mcspi_dev(FAR struct spi_dev_s *dev)
   return (FAR struct am67_mcspi_dev_s *)dev;
 }
 
-static bool am67_mcspi_waitstat(uint32_t base, uint8_t channel,
-                                uint32_t mask)
+static bool am67_mcspi_waitreg(uint32_t addr, uint32_t mask)
 {
-  volatile uint32_t count = AM67_MCSPI_POLL_TIMEOUT;
+  const uint32_t start = (uint32_t)up_perf_gettime();
+  uint32_t polls = 0;
 
-  while ((am67_mcspi_getreg(base, AM67_MCSPI_CHSTAT0 +
-                            AM67_MCSPI_CH_OFFSET(channel)) & mask) == 0)
+  while ((getreg32(addr) & mask) == 0)
     {
-      if (--count == 0)
+      if ((uint32_t)up_perf_gettime() - start > AM67_MCSPI_TIMEOUT_CYCLES ||
+          ++polls >= AM67_MCSPI_POLL_MAX)
         {
           return false;
         }
     }
 
   return true;
+}
+
+static bool am67_mcspi_waitstat(uint32_t base, uint8_t channel,
+                                uint32_t mask)
+{
+  return am67_mcspi_waitreg(base + AM67_MCSPI_CHSTAT0 +
+                            AM67_MCSPI_CH_OFFSET(channel), mask);
 }
 
 static void am67_mcspi_channel_enable(FAR struct am67_mcspi_dev_s *priv,
@@ -195,7 +221,12 @@ static void am67_mcspi_cs_force(FAR struct am67_mcspi_dev_s *priv,
        * truncates writes (e.g. the ICM-20948 bank-switch).
        */
 
-      am67_mcspi_waitstat(priv->base, priv->channel, AM67_MCSPI_CHSTAT_EOT);
+      if (!am67_mcspi_waitstat(priv->base, priv->channel,
+                               AM67_MCSPI_CHSTAT_EOT))
+        {
+          priv->errors++;
+        }
+
       chconf &= ~AM67_MCSPI_CHCONF_FORCE;  /* FORCE=0: CS deasserted (high) */
     }
   else
@@ -386,6 +417,13 @@ static void am67_mcspi_controller_init(FAR struct am67_mcspi_dev_s *priv)
   uint32_t modulctrl;
   uint8_t ch;
 
+  /* The status waits time out on the PMU cycle counter; make sure it
+   * counts (idempotent, same setup as up_perf_init()).
+   */
+
+  cp15_pmu_pmcr(PMCR_E);
+  cp15_pmu_cesr(PMCESR_CCES);
+
   /* Set HL_SYSCONFIG to no-idle so the OCP interconnect does not gate
    * the functional clock while we poll status registers.
    */
@@ -399,13 +437,16 @@ static void am67_mcspi_controller_init(FAR struct am67_mcspi_dev_s *priv)
   regval |= AM67_MCSPI_SYSCONFIG_SOFTRESET;
   am67_mcspi_putreg(priv->base, AM67_MCSPI_SYSCONFIG, regval);
 
-  /* Wait until SYSSTATUS.RESETDONE is 1 */
+  /* Wait until SYSSTATUS.RESETDONE is 1. On timeout carry on: the
+   * transfers then time out and are reported as errors.
+   */
 
-  do
+  if (!am67_mcspi_waitreg(priv->base + AM67_MCSPI_SYSSTATUS,
+                          AM67_MCSPI_SYSSTATUS_RESETDONE))
     {
-      regval = am67_mcspi_getreg(priv->base, AM67_MCSPI_SYSSTATUS);
+      spierr("ERROR: soft reset timeout\n");
+      priv->errors++;
     }
-  while ((regval & AM67_MCSPI_SYSSTATUS_RESETDONE) == 0);
 
   /* Configure CLOCKACTIVITY and SIDLEMODE */
 
@@ -436,32 +477,35 @@ static void am67_mcspi_controller_init(FAR struct am67_mcspi_dev_s *priv)
   am67_mcspi_apply_hwconfig(priv);
 }
 
-static uint32_t am67_mcspi_transfer_word(FAR struct am67_mcspi_dev_s *priv,
-                                         uint32_t wd)
+/* Shift one word. On a timeout count the error and return false; the
+ * caller stops the transfer, since every later word would time out too.
+ */
+
+static bool am67_mcspi_transfer_word(FAR struct am67_mcspi_dev_s *priv,
+                                     uint32_t wd, FAR uint32_t *rd)
 {
   uint32_t choff = AM67_MCSPI_CH_OFFSET(priv->channel);
-  const bool txs = am67_mcspi_waitstat(priv->base, priv->channel,
-                                       AM67_MCSPI_CHSTAT_TXS);
 
-  if (!txs)
+  if (!am67_mcspi_waitstat(priv->base, priv->channel,
+                           AM67_MCSPI_CHSTAT_TXS))
     {
       spierr("ERROR: TX timeout ch%u\n", priv->channel);
-      return 0;
+      priv->errors++;
+      return false;
     }
 
   am67_mcspi_putreg(priv->base, AM67_MCSPI_TX0 + choff, wd);
 
-  const bool rxs = am67_mcspi_waitstat(priv->base, priv->channel,
-                                       AM67_MCSPI_CHSTAT_RXS);
-  const uint32_t rd = rxs ? am67_mcspi_getreg(priv->base, AM67_MCSPI_RX0 + choff) : 0;
-
-  if (!rxs)
+  if (!am67_mcspi_waitstat(priv->base, priv->channel,
+                           AM67_MCSPI_CHSTAT_RXS))
     {
       spierr("ERROR: RX timeout ch%u\n", priv->channel);
-      return 0;
+      priv->errors++;
+      return false;
     }
 
-  return rd;
+  *rd = am67_mcspi_getreg(priv->base, AM67_MCSPI_RX0 + choff);
+  return true;
 }
 
 /****************************************************************************
@@ -512,13 +556,16 @@ static void am67_mcspi_setbits(FAR struct spi_dev_s *dev, int nbits)
 static uint32_t am67_mcspi_send(FAR struct spi_dev_s *dev, uint32_t wd)
 {
   FAR struct am67_mcspi_dev_s *priv = am67_mcspi_dev(dev);
+  uint32_t rd = 0;
 
   if (!priv->selected)
     {
+      priv->errors++;
       return 0;
     }
 
-  return am67_mcspi_transfer_word(priv, wd);
+  am67_mcspi_transfer_word(priv, wd, &rd);
+  return rd;
 }
 
 #ifdef CONFIG_SPI_EXCHANGE
@@ -527,10 +574,12 @@ static void am67_mcspi_exchange(FAR struct spi_dev_s *dev,
                                 FAR void *rxbuffer, size_t nwords)
 {
   FAR struct am67_mcspi_dev_s *priv = am67_mcspi_dev(dev);
+  uint32_t rd;
   size_t i;
 
   if (!priv->selected)
     {
+      priv->errors++;
       return;
     }
 
@@ -542,7 +591,11 @@ static void am67_mcspi_exchange(FAR struct spi_dev_s *dev,
       for (i = 0; i < nwords; i++)
         {
           uint32_t wd = (tx16 != NULL) ? (uint32_t)tx16[i] : 0xffffu;
-          uint32_t rd = am67_mcspi_transfer_word(priv, wd);
+
+          if (!am67_mcspi_transfer_word(priv, wd, &rd))
+            {
+              return;
+            }
 
           if (rx16 != NULL)
             {
@@ -558,7 +611,11 @@ static void am67_mcspi_exchange(FAR struct spi_dev_s *dev,
       for (i = 0; i < nwords; i++)
         {
           uint32_t wd = (tx8 != NULL) ? (uint32_t)tx8[i] : 0xffu;
-          uint32_t rd = am67_mcspi_transfer_word(priv, wd);
+
+          if (!am67_mcspi_transfer_word(priv, wd, &rd))
+            {
+              return;
+            }
 
           if (rx8 != NULL)
             {
@@ -612,7 +669,28 @@ void am67_mcspi_board_select(FAR struct spi_dev_s *dev, uint8_t channel,
     {
       am67_mcspi_cs_force(priv, true);
       priv->selected = false;
+
+      /* A word timed out: the controller may be wedged (clock gated, left
+       * in slave mode, FIFO state lost). Reset it so the next transfer
+       * starts clean; this also parks every chip-select.
+       */
+
+      if (priv->errors != priv->reset_at)
+        {
+          am67_mcspi_controller_init(priv);
+          priv->reset_at = priv->errors;
+        }
     }
+}
+
+int am67_mcspi_take_errors(FAR struct spi_dev_s *dev)
+{
+  FAR struct am67_mcspi_dev_s *priv = am67_mcspi_dev(dev);
+  uint32_t errors = priv->errors;
+
+  priv->errors = 0;
+  priv->reset_at = 0;
+  return errors > INT_MAX ? INT_MAX : (int)errors;
 }
 
 #endif /* CONFIG_AM67_MCSPI0 */

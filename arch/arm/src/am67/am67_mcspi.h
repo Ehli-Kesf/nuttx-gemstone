@@ -124,4 +124,11 @@ FAR struct spi_dev_s *am67_spibus_initialize(int port);
 void am67_mcspi_board_select(FAR struct spi_dev_s *dev, uint8_t channel,
                              bool selected);
 
+/* Number of failed words and status waits since the last call, then reset
+ * to 0. SPI exchange() cannot return an error, so a caller that must not
+ * use a failed transfer reads this after deselecting the device.
+ */
+
+int am67_mcspi_take_errors(FAR struct spi_dev_s *dev);
+
 #endif /* __ARCH_ARM_SRC_AM67_AM67_MCSPI_H */
