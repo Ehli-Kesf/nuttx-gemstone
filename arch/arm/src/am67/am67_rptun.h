@@ -20,6 +20,7 @@
 
 #ifdef CONFIG_RPTUN
 
+#include <stdbool.h>
 #include <nuttx/rptun/rptun.h>
 
 /****************************************************************************
@@ -78,6 +79,12 @@ extern const struct am67_rsc_s g_am67_rsc_table;
  ****************************************************************************/
 
 int am67_rptun_init(void);
+
+/* Refuse a remoteproc shutdown request from Linux while locked (PX4 calls
+ * this through BOARD_INDICATE_EXTERNAL_LOCKOUT_STATE while armed).
+ */
+
+void am67_rptun_set_lockout(bool locked);
 
 #endif /* CONFIG_RPTUN */
 #endif /* __ARCH_ARM_SRC_AM67_AM67_RPTUN_H */

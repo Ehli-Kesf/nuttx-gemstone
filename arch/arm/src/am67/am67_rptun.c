@@ -27,9 +27,11 @@
 
 #include <nuttx/config.h>
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <debug.h>
+#include <syslog.h>
 
 #include <arch/barriers.h>
 
@@ -42,6 +44,14 @@
 
 #include "am67_rptun.h"
 #include "arm_internal.h"
+
+#if defined(CONFIG_AM67_EPWM0) || defined(CONFIG_AM67_EPWM1)
+#  include "am67_pwm.h"
+#endif
+#if defined(CONFIG_AM67_ECAP0) || defined(CONFIG_AM67_ECAP1) || \
+    defined(CONFIG_AM67_ECAP2)
+#  include "am67_ecap.h"
+#endif
 
 #ifdef CONFIG_RPTUN
 
@@ -103,6 +113,17 @@
 #define AM67_MBOX_EOI              (AM67_MBOX_BASE + 0x140u)
 #define AM67_MBOX_NEW_MSG_INT(n)   (1u << ((n) * 2u))
 
+/* Control messages of the TI remoteproc mailbox protocol (Linux
+ * drivers/remoteproc/omap_remoteproc.h). Anything below RP_MBOX_READY is a
+ * virtqueue id.
+ */
+
+#define RP_MBOX_READY              0xffffff00u
+#define RP_MBOX_ECHO_REQUEST       0xffffff03u
+#define RP_MBOX_ECHO_REPLY         0xffffff04u
+#define RP_MBOX_SHUTDOWN           0xffffff14u
+#define RP_MBOX_SHUTDOWN_ACK       0xffffff15u
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -113,6 +134,7 @@ struct am67_rptun_dev_s
   rptun_callback_t   callback;
   void              *arg;
   struct work_s      work;
+  struct work_s      shutdown_work;
 };
 
 /****************************************************************************
@@ -155,6 +177,10 @@ static const struct rptun_ops_s g_am67_rptun_ops =
 };
 
 static struct am67_rptun_dev_s g_am67_rptun_dev;
+
+/* Set while PX4 must not be stopped (armed); see am67_rptun_set_lockout() */
+
+static volatile bool g_am67_rptun_lockout;
 
 /****************************************************************************
  * Private Functions
@@ -280,6 +306,56 @@ static void am67_rptun_notify_work(void *arg)
 }
 
 /****************************************************************************
+ * Name: am67_rptun_shutdown_work
+ *
+ * Description:
+ *   Linux `echo stop > /sys/class/remoteproc/.../state` sends
+ *   RP_MBOX_SHUTDOWN and waits 5 s for RP_MBOX_SHUTDOWN_ACK, then 2 ms for
+ *   the core to sit in WFI before it halts it.  While the vehicle is armed
+ *   no ACK is sent: Linux gives up with -EBUSY and the autopilot keeps
+ *   flying.  Otherwise the motor outputs are cut first, then the ACK is
+ *   sent and the core parks in WFI with every interrupt source masked at
+ *   the VIM, since a pending interrupt would wake WFI even with CPSR.I set.
+ *
+ ****************************************************************************/
+
+static void am67_rptun_shutdown_work(void *arg)
+{
+  int irq;
+
+  if (g_am67_rptun_lockout)
+    {
+      syslog(LOG_WARNING, "rptun: shutdown refused, vehicle armed\n");
+      return;
+    }
+
+  syslog(LOG_WARNING, "rptun: shutdown, motor outputs off, halting\n");
+
+  up_irq_save();
+
+#if defined(CONFIG_AM67_EPWM0) || defined(CONFIG_AM67_EPWM1)
+  am67_epwm_emergency_stop();
+#endif
+#if defined(CONFIG_AM67_ECAP0) || defined(CONFIG_AM67_ECAP1) || \
+    defined(CONFIG_AM67_ECAP2)
+  am67_ecap_emergency_stop();
+#endif
+
+  for (irq = 0; irq < NR_IRQS; irq++)
+    {
+      up_disable_irq(irq);
+    }
+
+  putreg32(RP_MBOX_SHUTDOWN_ACK, AM67_MBOX_MESSAGE(AM67_MBOX_TX_FIFO));
+  UP_DSB();
+
+  for (; ; )
+    {
+      asm volatile ("wfi");
+    }
+}
+
+/****************************************************************************
  * Name: am67_rptun_interrupt
  *
  * Description:
@@ -293,14 +369,26 @@ static void am67_rptun_notify_work(void *arg)
 static int am67_rptun_interrupt(int irq, void *context, void *arg)
 {
   struct am67_rptun_dev_s *priv = (struct am67_rptun_dev_s *)arg;
+  bool shutdown = false;
 
   /* Drain all messages Linux wrote into FIFO 1.  Each read pops one
-   * entry; stop when MSG_STATUS reports 0 pending messages.
+   * entry; stop when MSG_STATUS reports 0 pending messages.  Virtqueue
+   * kicks all collapse into one RPTUN_NOTIFY_ALL pass below; control
+   * messages are handled here.
    */
 
   while (getreg32(AM67_MBOX_MSG_STATUS(AM67_MBOX_RX_FIFO)) != 0)
     {
-      (void)getreg32(AM67_MBOX_MESSAGE(AM67_MBOX_RX_FIFO));
+      uint32_t msg = getreg32(AM67_MBOX_MESSAGE(AM67_MBOX_RX_FIFO));
+
+      if (msg == RP_MBOX_ECHO_REQUEST)
+        {
+          am67_rptun_notify(&priv->rptun, RP_MBOX_ECHO_REPLY);
+        }
+      else if (msg == RP_MBOX_SHUTDOWN)
+        {
+          shutdown = true;
+        }
     }
 
   /* Clear the new-message interrupt status for user-3 / FIFO-1.
@@ -323,12 +411,27 @@ static int am67_rptun_interrupt(int irq, void *context, void *arg)
       work_queue(HPWORK, &priv->work, am67_rptun_notify_work, priv, 0);
     }
 
+  if (shutdown && work_available(&priv->shutdown_work))
+    {
+      work_queue(HPWORK, &priv->shutdown_work, am67_rptun_shutdown_work,
+                 priv, 0);
+    }
+
   return OK;
 }
 
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
+
+/****************************************************************************
+ * Name: am67_rptun_set_lockout
+ ****************************************************************************/
+
+void am67_rptun_set_lockout(bool locked)
+{
+  g_am67_rptun_lockout = locked;
+}
 
 /****************************************************************************
  * Name: am67_rptun_init
