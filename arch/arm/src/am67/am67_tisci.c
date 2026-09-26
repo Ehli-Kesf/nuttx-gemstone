@@ -16,6 +16,9 @@
 #include <string.h>
 #include <syslog.h>
 
+#include <nuttx/arch.h>
+#include <nuttx/mutex.h>
+
 #include "arm_internal.h"
 
 /* tisci/tisci.h uses begin_packed, which this NuttX does not define, so the
@@ -46,6 +49,15 @@
 #define SPROXY_DATA_LAST   0x3cu
 #define SPROXY_COUNT_MASK  0xffu
 
+/* Longest wait for the Device Manager's response. */
+
+#define SPROXY_TIMEOUT_US  10000u
+
+/* One request in flight at a time: pwm_out, the I2C work queue and board
+ * init can all power a device, and they share one secure proxy thread.
+ */
+
+static mutex_t g_lock = NXMUTEX_INITIALIZER;
 static uint8_t g_seq;
 
 static void sproxy_read_msg(uint32_t base)
@@ -57,6 +69,11 @@ static void sproxy_read_msg(uint32_t base)
       (void)getreg32(base + off);
     }
 }
+
+/* Send one message and read the response whose header (type, host, seq)
+ * matches it.  A response left over from an earlier request that timed
+ * out is read and dropped, instead of being taken for this one.
+ */
 
 static int sproxy_xfer(const void *tx, size_t txlen,
                        void *rx, size_t rxlen)
@@ -73,6 +90,9 @@ static int sproxy_xfer(const void *tx, size_t txlen,
   size_t left = txlen;
   size_t got = 0;
   unsigned int spins;
+  uint32_t hdr;
+
+  memcpy(&hdr, tx, sizeof(hdr));
 
   if ((getreg32(tx_rt) & SPROXY_COUNT_MASK) == 0u)
     {
@@ -102,17 +122,27 @@ static int sproxy_xfer(const void *tx, size_t txlen,
 
   UP_DSB();
 
-  for (spins = 0; spins < 200000u; spins++)
+  for (spins = 0; ; spins++)
     {
       if ((getreg32(rx_rt) & SPROXY_COUNT_MASK) != 0u)
         {
-          break;
-        }
-    }
+          /* The first word is type (16), host (8), seq (8). */
 
-  if ((getreg32(rx_rt) & SPROXY_COUNT_MASK) == 0u)
-    {
-      return -ETIMEDOUT;
+          if (getreg32(rx_base + SPROXY_DATA_FIRST) == hdr)
+            {
+              break;
+            }
+
+          sproxy_read_msg(rx_base);
+          continue;
+        }
+
+      if (spins >= SPROXY_TIMEOUT_US)
+        {
+          return -ETIMEDOUT;
+        }
+
+      up_udelay(1);
     }
 
   for (off = SPROXY_DATA_FIRST; off <= SPROXY_DATA_LAST; off += 4u)
@@ -161,6 +191,12 @@ int am67_tisci_device_on(uint32_t id)
   memset(&req, 0, sizeof(req));
   memset(&resp, 0, sizeof(resp));
 
+  ret = nxmutex_lock(&g_lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
   req.type = TISCI_MSG_SET_DEVICE;
   req.host = TISCI_HOST_ID_MAIN_0_R5_1;
   req.seq = g_seq++;
@@ -178,6 +214,7 @@ int am67_tisci_device_on(uint32_t id)
   raw[16] = req.state;
 
   ret = sproxy_xfer(raw, sizeof(raw), &resp, sizeof(resp));
+  nxmutex_unlock(&g_lock);
 
   if (ret < 0)
     {
