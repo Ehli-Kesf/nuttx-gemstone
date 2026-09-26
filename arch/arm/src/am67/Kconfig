@@ -98,6 +98,16 @@ config AM67_I2C
 
 if AM67_I2C
 
+config AM67_RTI8_WDT
+	bool "AM67 RTI8 watchdog for MAIN R5F core 0 (FIQ motor cut)"
+	default n
+	select ARMV7R_DECODEFIQ
+	---help---
+		RTI8 windowed watchdog with an NMI reaction routed as FIQ. The
+		FIQ handler cuts the EPWM/eCAP outputs, records the hung context
+		in g_am67_wdt_fiq_info and halts the core. The caller starts and
+		kicks it (am67_rti.h).
+
 config AM67_I2C0
 	bool "AM67 MCU_I2C0 driver (MCU domain, 0x04900000)"
 	default n

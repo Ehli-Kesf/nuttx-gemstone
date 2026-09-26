@@ -27,6 +27,10 @@ if(CONFIG_RPTUN)
   list(APPEND SRCS am67_rptun.c)
 endif()
 
+if(CONFIG_AM67_RTI8_WDT)
+  list(APPEND SRCS am67_rti.c)
+endif()
+
 target_link_options(nuttx PRIVATE -Wl,--entry=_vector_start)
 
 target_sources(arch PRIVATE ${SRCS})

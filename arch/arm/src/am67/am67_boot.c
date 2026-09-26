@@ -240,6 +240,15 @@ void arm_boot(void)
 
   arm_fpuconfig();
 
+  /* __start masks FIQ.  Tasks start with FIQ enabled when
+   * ARMV7R_DECODEFIQ is set (arm_initialstate()); unmask it for the idle
+   * context too.  No VIM input is routed as FIQ until the watchdog is armed.
+   */
+
+#ifdef CONFIG_ARMV7R_DECODEFIQ
+  __asm__ __volatile__ ("cpsie f" ::: "memory");
+#endif
+
   /* Do pinmux to get UART early */
 
   am67_pinmux_init();
