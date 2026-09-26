@@ -231,6 +231,15 @@ void arm_boot(void)
 
   am67_mpu_init();
 
+  /* Enable the VFPv3-D16 before any C code can emit a floating-point
+   * instruction: with CONFIG_ARCH_FPU the whole image is built hard-float.
+   * This must follow am67_mpu_init(): arm_fpuconfig() lives in DDR, and
+   * the linker script keeps everything that runs before the MPU is set up
+   * in ATCM.  Called earlier, the R5F never reached nx_start().
+   */
+
+  arm_fpuconfig();
+
   /* Do pinmux to get UART early */
 
   am67_pinmux_init();

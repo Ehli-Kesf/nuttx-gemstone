@@ -91,6 +91,7 @@ config ARCH_CHIP_AM67
 	select ARCH_HAVE_FETCHADD
 	select ARCH_HAVE_LOWVECTORS
 	select ARCH_HAVE_TICKLESS
+	select ARCH_HAVE_DPFPU
 	select 16550_TXFULL_SSR if 16550_UART
 	---help---
 		TI AM67 family
