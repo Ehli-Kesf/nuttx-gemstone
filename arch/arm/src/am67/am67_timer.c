@@ -74,6 +74,8 @@
 #define TIMER_TCLR                         (0x38u)
 #define TIMER_TCRR                         (0x3cu)
 #define TIMER_TLDR                         (0x40u)
+#define TIMER_TWPS                         (0x48u)
+#define TIMER_TSICR                        (0x54u)
 
 /****************************************************************************
  * Private Types
@@ -173,6 +175,30 @@ static void am67_timer_setup(uint32_t base_addr,
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
+
+/****************************************************************************
+ * Name: am67_timer_nonposted
+ *
+ * Description:
+ *   Leave posted mode (TSICR.POSTED, 1 after reset).  In posted mode a write
+ *   to TCLR/TCRR/TLDR/TTGR/TMAR while an earlier write to the same register
+ *   is still pending is silently dropped, and reading such a register
+ *   returns a stale value; nothing here polls TWPS.  Non-posted writes
+ *   complete before the bus access ends, which costs a few functional clock
+ *   cycles per write.
+ *
+ ****************************************************************************/
+
+static void am67_timer_nonposted(uint32_t base_addr)
+{
+  unsigned int spins = 0;
+
+  while (getreg32(base_addr + TIMER_TWPS) != 0 && ++spins < 100000)
+    {
+    }
+
+  putreg32(0, base_addr + TIMER_TSICR);
+}
 
 /****************************************************************************
  * Name: am67_timer_start
@@ -496,6 +522,7 @@ void up_timer_initialize(void)
   irq_attach(CSLR_R5FSS0_CORE0_INTR_TIMER0_INTR_PEND_0,
              timer_tick_isr, NULL);
 
+  am67_timer_nonposted(AM67_DMTIMER1_1MS_TIMER0_VADDR);
   am67_timer_stop(AM67_DMTIMER1_1MS_TIMER0_VADDR);
   am67_timer_setup(AM67_DMTIMER1_1MS_TIMER0_VADDR, &params);
   am67_timer_start(AM67_DMTIMER1_1MS_TIMER0_VADDR);
