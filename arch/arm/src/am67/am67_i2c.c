@@ -80,6 +80,11 @@
 
 /* Interrupt wait time timeout in system timer ticks */
 
+/* Longest busy wait for the bus to go free before a transfer */
+
+#define AM67_I2C_WAITSTOP_MAX_US   2000
+#define AM67_I2C_WAITSTOP_STEP_US  10
+
 #ifndef CONFIG_AM67_I2CTIMEOTICKS
 #  define CONFIG_AM67_I2CTIMEOTICKS \
     (SEC2TICK(CONFIG_AM67_I2CTIMEOSEC) + MSEC2TICK(CONFIG_AM67_I2CTIMEOMS))
@@ -553,32 +558,21 @@ static inline int am67_i2c_sem_waitdone(struct am67_i2c_priv_s *priv)
 static inline bool
 am67_i2c_sem_waitstop(struct am67_i2c_priv_s *priv)
 {
-  clock_t start;
-  clock_t elapsed;
-  clock_t timeout;
+  unsigned int waited_us;
   uint32_t regval;
-
-  /* Select a timeout */
-
-#ifdef CONFIG_AM67_I2C_DYNTIMEO
-  timeout = USEC2TICK(CONFIG_AM67_I2C_DYNTIMEO_STARTSTOP);
-#else
-  timeout = CONFIG_AM67_I2CTIMEOTICKS;
-#endif
 
   /* Wait as stop might still be in progress; but stop might also
    * be set because of a timeout error: "The [STOP] bit is set and
    * cleared by software, cleared by hardware when a Stop condition is
    * detected, set by hardware when a timeout error is detected."
+   *
+   * This is a busy wait on the caller's thread, so keep it short: a STOP
+   * takes about one bit time (10 us at 100 kHz).  It used to spin for the
+   * full transfer timeout (500 ms) on a stuck bus.
    */
 
-  start = clock_systime_ticks();
-  do
+  for (waited_us = 0; ; waited_us += AM67_I2C_WAITSTOP_STEP_US)
     {
-      /* Calculate the elapsed time */
-
-      elapsed = clock_systime_ticks() - start;
-
       /* Check for Bus Free condition */
 
       regval = am67_i2c_getreg(priv, AM67_I2C_IRQ_STAT_RAW_OFFSET);
@@ -586,11 +580,14 @@ am67_i2c_sem_waitstop(struct am67_i2c_priv_s *priv)
         {
           return true;
         }
+
+      if (waited_us >= AM67_I2C_WAITSTOP_MAX_US)
+        {
+          break;
+        }
+
+      up_udelay(AM67_I2C_WAITSTOP_STEP_US);
     }
-
-  /* Loop until the stop is complete or a timeout occurs. */
-
-  while (elapsed < timeout);
 
   /* If we get here then a timeout occurred with the STOP condition
    * still pending.
@@ -1406,6 +1403,16 @@ static int am67_i2c_transfer(struct i2c_master_s *dev,
     {
       i2cerr("ERROR: Bus busy, raw status: 0x%" PRIx32 "\n",
              am67_i2c_getreg(priv, AM67_I2C_IRQ_STAT_RAW_OFFSET));
+    }
+
+  /* A timeout or a bus that stays busy leaves the controller in an unknown
+   * state.  Soft-reset and reconfigure it before the next transfer instead
+   * of failing every transfer that follows.
+   */
+
+  if (ret == -ETIMEDOUT || ret == -EBUSY || ret == -EIO)
+    {
+      priv->inited = false;
     }
 
   nxmutex_unlock(&priv->lock);
