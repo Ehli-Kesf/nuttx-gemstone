@@ -72,4 +72,8 @@ ifeq ($(CONFIG_AM67_DSHOT),y)
 CHIP_CSRCS += am67_dshot.c
 CHIP_ASRCS += am67_dshot_fiq.S
 endif
+
+ifeq ($(CONFIG_AM67_SDHCI0),y)
+CHIP_CSRCS += am67_sdhci.c
+endif
 CHIP_CSRCS += am67_rat.c

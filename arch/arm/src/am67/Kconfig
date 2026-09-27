@@ -113,6 +113,16 @@ config AM67_DSHOT
 		period is one bit with shadowed compares; a FIQ at CTR = 0
 		(EPWM0 event trigger, VIM 36) writes the next bit from ATCM.
 
+config AM67_SDHCI0
+	bool "AM67 MMCSD0 (eMMC) SDIO driver"
+	default n
+	select ARCH_HAVE_SDIO
+	select SDIO_BLOCKSETUP
+	---help---
+		The on-board eMMC on MMCSD0 as an SDIO lower half for
+		drivers/mmcsd: 4-bit, legacy timing at 20 MHz, programmed I/O.
+		Linux must leave sdhci0 disabled.
+
 config AM67_I2C
 	bool "AM67 I2C support"
 	default n

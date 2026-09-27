@@ -35,6 +35,10 @@ if(CONFIG_AM67_DSHOT)
   list(APPEND SRCS am67_dshot.c am67_dshot_fiq.S)
 endif()
 
+if(CONFIG_AM67_SDHCI0)
+  list(APPEND SRCS am67_sdhci.c)
+endif()
+
 target_link_options(nuttx PRIVATE -Wl,--entry=_vector_start)
 
 target_sources(arch PRIVATE ${SRCS})
