@@ -25,6 +25,8 @@
  * few constants this file needs are repeated here. */
 
 #define TISCI_MSG_SET_DEVICE                     0x0200u
+#define TISCI_MSG_GET_FREQ                       0x010eu
+#define TISCI_MSG_GET_DEVICE                     0x0201u
 #define TISCI_MSG_FLAG_AOP                       (1u << 1)
 #define TISCI_MSG_FLAG_ACK                       (1u << 1)
 #define TISCI_MSG_VALUE_DEVICE_SW_STATE_ON       2u
@@ -230,5 +232,105 @@ int am67_tisci_device_on(uint32_t id)
     }
 
   syslog(LOG_INFO, "tisci dev %" PRIu32 " on: ack\n", id);
+  return 0;
+}
+
+/* Read the current frequency of clock `clk` of device `dev` (the Linux
+ * DTS <&k3_clks dev clk> pair).
+ */
+
+int am67_tisci_get_freq(uint32_t dev, uint8_t clk, uint64_t *hz)
+{
+  uint16_t type = TISCI_MSG_GET_FREQ;
+  uint32_t flags = TISCI_MSG_FLAG_AOP;
+  uint8_t req[13];
+  uint8_t resp[16];
+  int ret;
+
+  memset(req, 0, sizeof(req));
+  memset(resp, 0, sizeof(resp));
+
+  ret = nxmutex_lock(&g_lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  /* Packed: header (type, host, seq, flags), device, clock */
+
+  memcpy(req + 0, &type, 2);
+  req[2] = TISCI_HOST_ID_MAIN_0_R5_1;
+  req[3] = g_seq++;
+  memcpy(req + 4, &flags, 4);
+  memcpy(req + 8, &dev, 4);
+  req[12] = clk;
+
+  ret = sproxy_xfer(req, sizeof(req), resp, sizeof(resp));
+  nxmutex_unlock(&g_lock);
+
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  /* Response: header, then the frequency in Hz (64 bit) */
+
+  memcpy(&flags, resp + 4, 4);
+  if ((flags & TISCI_MSG_FLAG_ACK) == 0u)
+    {
+      return -EIO;
+    }
+
+  memcpy(hz, resp + 8, 8);
+  return 0;
+}
+
+/* Read the state of device `id`: *programmed is what the hosts asked for,
+ * *current what the hardware is in (0 off, 1 on, 2 in transition).  Works
+ * for a device another host holds exclusively.
+ */
+
+int am67_tisci_get_device(uint32_t id, uint8_t *programmed,
+                          uint8_t *current)
+{
+  uint16_t type = TISCI_MSG_GET_DEVICE;
+  uint32_t flags = TISCI_MSG_FLAG_AOP;
+  uint8_t req[12];
+  uint8_t resp[18];
+  int ret;
+
+  memset(req, 0, sizeof(req));
+  memset(resp, 0, sizeof(resp));
+
+  ret = nxmutex_lock(&g_lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  memcpy(req + 0, &type, 2);
+  req[2] = TISCI_HOST_ID_MAIN_0_R5_1;
+  req[3] = g_seq++;
+  memcpy(req + 4, &flags, 4);
+  memcpy(req + 8, &id, 4);
+
+  ret = sproxy_xfer(req, sizeof(req), resp, sizeof(resp));
+  nxmutex_unlock(&g_lock);
+
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  /* Response: header, context loss count, resets, programmed, current */
+
+  memcpy(&flags, resp + 4, 4);
+  if ((flags & TISCI_MSG_FLAG_ACK) == 0u)
+    {
+      return -EIO;
+    }
+
+  *programmed = resp[16];
+  *current = resp[17];
   return 0;
 }
