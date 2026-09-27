@@ -38,6 +38,8 @@
 #include <nuttx/arch.h>
 #include <nuttx/irq.h>
 #include <nuttx/kmalloc.h>
+#include <nuttx/kthread.h>
+#include <nuttx/semaphore.h>
 #include <nuttx/nuttx.h>
 #include <nuttx/rptun/rptun.h>
 #include <nuttx/wqueue.h>
@@ -119,6 +121,7 @@
  */
 
 #define RP_MBOX_READY              0xffffff00u
+#define RP_MBOX_CRASH              0xffffff02u
 #define RP_MBOX_ECHO_REQUEST       0xffffff03u
 #define RP_MBOX_ECHO_REPLY         0xffffff04u
 #define RP_MBOX_SHUTDOWN           0xffffff14u
@@ -134,7 +137,6 @@ struct am67_rptun_dev_s
   rptun_callback_t   callback;
   void              *arg;
   struct work_s      work;
-  struct work_s      shutdown_work;
 };
 
 /****************************************************************************
@@ -181,6 +183,10 @@ static struct am67_rptun_dev_s g_am67_rptun_dev;
 /* Set while PX4 must not be stopped (armed); see am67_rptun_set_lockout() */
 
 static volatile bool g_am67_rptun_lockout;
+
+/* The mailbox interrupt posts it; am67_rptun_stopper() handles the request */
+
+static sem_t g_am67_rptun_stopsem = SEM_INITIALIZER(0);
 
 /****************************************************************************
  * Private Functions
@@ -306,7 +312,7 @@ static void am67_rptun_notify_work(void *arg)
 }
 
 /****************************************************************************
- * Name: am67_rptun_shutdown_work
+ * Name: am67_rptun_shutdown
  *
  * Description:
  *   Linux `echo stop > /sys/class/remoteproc/.../state` sends
@@ -317,9 +323,15 @@ static void am67_rptun_notify_work(void *arg)
  *   sent and the core parks in WFI with every interrupt source masked at
  *   the VIM, since a pending interrupt would wake WFI even with CPSR.I set.
  *
+ *   Runs in its own highest-priority thread (am67_rptun_stopper()), not in
+ *   a work queue: a blocked work queue (PX4 runs its reboot through
+ *   HPWORK) must not keep Linux from stopping the core.  Not from the
+ *   interrupt either: parked from interrupt context, WFI did not hold
+ *   (REHBER 5.23).
+ *
  ****************************************************************************/
 
-static void am67_rptun_shutdown_work(void *arg)
+static void am67_rptun_shutdown(void)
 {
   int irq;
 
@@ -353,6 +365,17 @@ static void am67_rptun_shutdown_work(void *arg)
     {
       asm volatile ("wfi");
     }
+}
+
+static int am67_rptun_stopper(int argc, char *argv[])
+{
+  for (; ; )
+    {
+      nxsem_wait_uninterruptible(&g_am67_rptun_stopsem);
+      am67_rptun_shutdown();                /* returns only if locked */
+    }
+
+  return 0;
 }
 
 /****************************************************************************
@@ -411,10 +434,9 @@ static int am67_rptun_interrupt(int irq, void *context, void *arg)
       work_queue(HPWORK, &priv->work, am67_rptun_notify_work, priv, 0);
     }
 
-  if (shutdown && work_available(&priv->shutdown_work))
+  if (shutdown)
     {
-      work_queue(HPWORK, &priv->shutdown_work, am67_rptun_shutdown_work,
-                 priv, 0);
+      nxsem_post(&g_am67_rptun_stopsem);
     }
 
   return OK;
@@ -431,6 +453,22 @@ static int am67_rptun_interrupt(int irq, void *context, void *arg)
 void am67_rptun_set_lockout(bool locked)
 {
   g_am67_rptun_lockout = locked;
+}
+
+/****************************************************************************
+ * Name: am67_rptun_request_restart
+ ****************************************************************************/
+
+void am67_rptun_request_restart(void)
+{
+  /* Linux logs "K3 R5F rproc <name> crashed" (ti_k3_common.c), nothing
+   * more; gem-r5f-restart.service reacts to that line with remoteproc
+   * stop/start.  The stop still goes through the shutdown handshake, so a
+   * locked (armed) core refuses it.
+   */
+
+  putreg32(RP_MBOX_CRASH, AM67_MBOX_MESSAGE(AM67_MBOX_TX_FIFO));
+  UP_DSB();
 }
 
 /****************************************************************************
@@ -455,6 +493,14 @@ int am67_rptun_init(void)
            AM67_MBOX_IRQDISABLE(AM67_MBOX_USER));
   putreg32(AM67_MBOX_NEW_MSG_INT(AM67_MBOX_RX_FIFO),
            AM67_MBOX_IRQSTATUS(AM67_MBOX_USER));
+
+  ret = kthread_create("rptun_stop", SCHED_PRIORITY_MAX, 2048,
+                       am67_rptun_stopper, NULL);
+  if (ret < 0)
+    {
+      ipcerr("ERROR: rptun_stop thread: %d\n", ret);
+      return ret;
+    }
 
   ret = irq_attach(AM67_RPTUN_IRQ_EVENT, am67_rptun_interrupt, dev);
   if (ret < 0)

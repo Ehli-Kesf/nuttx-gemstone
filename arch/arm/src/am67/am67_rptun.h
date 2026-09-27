@@ -86,5 +86,12 @@ int am67_rptun_init(void);
 
 void am67_rptun_set_lockout(bool locked);
 
+/* Ask Linux to restart this core (remoteproc stop/start).  Sends
+ * RP_MBOX_CRASH; the Linux side needs gem-r5f-restart.service.  The core
+ * must keep running with interrupts on to answer the shutdown request.
+ */
+
+void am67_rptun_request_restart(void);
+
 #endif /* CONFIG_RPTUN */
 #endif /* __ARCH_ARM_SRC_AM67_AM67_RPTUN_H */
