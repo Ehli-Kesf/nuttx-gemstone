@@ -100,6 +100,7 @@
 #define VIM_INT_MAP(j)          (VIM_BASE + 0x418u + (((j) >> 5) * 0x20u))
 #define VIM_INT_TYPE(j)         (VIM_BASE + 0x41cu + (((j) >> 5) * 0x20u))
 #define VIM_FIQVEC              (VIM_BASE + 0x1cu)
+#define VIM_ACTFIQ              (VIM_BASE + 0x24u)
 #define VIM_BIT(j)              (1u << ((j) & 0x1fu))
 
 /****************************************************************************
@@ -108,8 +109,8 @@
 
 /* Where the core was when the watchdog fired, for post-mortem reading from
  * Linux (scripts/kart/r5f-inspect.sh read32): magic, pc, lr, cpsr, sp and
- * the halted-wait stage (am67_rptun_halted_wait).  Cleaned to DDR after
- * every update, since a halted core never evicts the cache line.
+ * the VIM input taken.  Cleaned to DDR after every update, since a halted
+ * core never evicts the cache line.
  */
 
 volatile uint32_t g_am67_wdt_fiq_info[AM67_WDT_INFO_WORDS]
@@ -195,14 +196,17 @@ void am67_rti_wdt_arm_fiq(void)
  * Name: arm_decodefiq
  *
  * Description:
- *   Only the watchdog is routed as FIQ.  Cut the motors, record where the
- *   core was, then never return: whatever hung the control loop is still
+ *   The watchdog is the only FIQ that reaches this handler (the DShot
+ *   engine takes its own FIQ before it, am67_dshot_fiq.S), so any FIQ here
+ *   is fatal.  Cut the motors, record where the core was and which VIM
+ *   input fired, then never return: whatever hung the control loop is still
  *   there.  Linux can read g_am67_wdt_fiq_info.
  *
  ****************************************************************************/
 
 uint32_t *arm_decodefiq(uint32_t *regs)
 {
+  uint32_t act;
   int irq;
 
 #if defined(CONFIG_AM67_EPWM0) || defined(CONFIG_AM67_EPWM1)
@@ -218,14 +222,17 @@ uint32_t *arm_decodefiq(uint32_t *regs)
    */
 
   (void)getreg32(VIM_FIQVEC);
-  putreg32(VIM_BIT(AM67_RTI8_IRQ), VIM_STS(AM67_RTI8_IRQ));
+  act = getreg32(VIM_ACTFIQ);
+  irq = (act & 0x80000000u) != 0 ? (int)(act & 0x3ffu) : AM67_RTI8_IRQ;
+  putreg32(VIM_BIT(irq), VIM_STS(irq));
   putreg32(RTI_WDSTATUS_ALL, RTI8_BASE + RTI_WDSTATUS);
-  putreg32(AM67_RTI8_IRQ, VIM_FIQVEC);
+  putreg32(irq, VIM_FIQVEC);
 
   am67_wdt_info_set(1, regs[REG_PC]);
   am67_wdt_info_set(2, regs[REG_LR]);
   am67_wdt_info_set(3, regs[REG_CPSR]);
   am67_wdt_info_set(4, regs[REG_SP]);
+  am67_wdt_info_set(5, act);
   am67_wdt_info_set(0, AM67_WDT_INFO_MAGIC);
 
   /* Stay here with every interrupt source disabled at the VIM.  The core

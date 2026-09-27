@@ -29,7 +29,8 @@
 #ifdef CONFIG_AM67_RTI8_WDT
 
 /* Post-mortem block g_am67_wdt_fiq_info: [0] magic, [1] pc, [2] lr,
- * [3] cpsr, [4] sp of the hung context.
+ * [3] cpsr, [4] sp of the hung context, [5] VIM ACTFIQ (bit 31 valid,
+ * bits 9:0 input; 30 = RTI8).
  */
 
 #define AM67_WDT_INFO_WORDS  8
