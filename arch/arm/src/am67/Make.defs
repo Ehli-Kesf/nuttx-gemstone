@@ -68,4 +68,8 @@ endif
 ifeq ($(CONFIG_AM67_RTI8_WDT),y)
 CHIP_CSRCS += am67_rti.c
 endif
+ifeq ($(CONFIG_AM67_DSHOT),y)
+CHIP_CSRCS += am67_dshot.c
+CHIP_ASRCS += am67_dshot_fiq.S
+endif
 CHIP_CSRCS += am67_rat.c

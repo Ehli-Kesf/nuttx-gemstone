@@ -856,6 +856,13 @@ static int am67_epwm_setup(struct pwm_lowerhalf_s *dev)
       return -EIO;
     }
 
+  /* No event-trigger interrupt: a DShot image may have left it enabled,
+   * and the module keeps its state across an R5F reload.
+   */
+
+  am67_epwm_putreg16(priv->base, AM67_EPWM_ETSEL_OFFSET, 0);
+  am67_epwm_putreg16(priv->base, AM67_EPWM_ETCLR_OFFSET, AM67_EPWM_ET_INT);
+
   am67_epwm_pinmux_init(priv->pinmux_id);
   am67_epwm_set_cmpctl(priv->base);
   am67_epwm_set_tbctl(priv->base);
@@ -1219,6 +1226,127 @@ int am67_epwm_init(void)
     }
 
   return am67_epwm_enable_register_write();
+}
+
+/****************************************************************************
+ * Name: am67_epwm_dshot_setup
+ *
+ * Description:
+ *   Take EPWM0 and EPWM1 (all four motor pins) for DShot, driven bit by
+ *   bit from am67_dshot.c.  Each counter period is one DShot bit: the pin
+ *   goes high at CTR = 0 and low at the compare, and the compares are
+ *   shadowed (loaded at CTR = 0), so every edge is placed by hardware; the
+ *   software only has to write the next bit within one bit period.  EPWM1
+ *   follows EPWM0 through the hardwired SYNCOUT -> SYNCIN link, so the four
+ *   outputs share one time base and one interrupt (EPWM0 ET at CTR = 0).
+ *   setup() still runs first: power, pinmux, trip zone and EALLOW, so the
+ *   emergency stop keeps working.  The pins are held low by the continuous
+ *   software force, which am67_dshot.c releases per bit; it loads at
+ *   CTR = PRD, where no action is programmed.  Compares stay non-zero: a
+ *   compare loaded at CTR = 0 does not act at that same CTR = 0.  Changing
+ *   the protocol of a running module needs a reboot (PWM_MAIN_TIMx).
+ *
+ * Input Parameters:
+ *   tbprd - counter period minus one, in 250 MHz TBCLK ticks
+ *
+ * Returned Value:
+ *   Zero (OK) on success; a negated errno value on failure.
+ *
+ ****************************************************************************/
+
+int am67_epwm_dshot_setup(uint16_t tbprd)
+{
+  struct am67_epwm_s *const epwm[2] =
+  {
+    &g_am67_epwm0, &g_am67_epwm1
+  };
+
+  int ret;
+  int n;
+
+  for (n = 0; n < 2; n++)
+    {
+      struct am67_epwm_s *priv = epwm[n];
+      uint32_t base = priv->base;
+      uint16_t tbctl;
+
+      if (!priv->live)
+        {
+          ret = am67_epwm_setup((struct pwm_lowerhalf_s *)priv);
+          if (ret < 0)
+            {
+              return ret;
+            }
+        }
+
+      /* Hold both pins low while the module is reconfigured */
+
+      am67_epwm_park_outputs(base);
+
+      /* Frozen, TBCLK = 250 MHz (no prescale), period shadowed.  EPWM0
+       * emits SYNCOUT at CTR = 0; EPWM1 reloads its counter from it.
+       */
+
+      tbctl = AM67_EPWM_TBCTL_CTRMODE_STOP_FREEZE <<
+              AM67_EPWM_TBCTL_CTRMODE_SHIFT;
+      tbctl |= (n == 0 ? 1u : 3u) << AM67_EPWM_TBCTL_SYNCOSEL_SHIFT;
+      if (n == 1)
+        {
+          tbctl |= AM67_EPWM_TBCTL_PHSEN_MASK;
+        }
+
+      am67_epwm_putreg16(base, AM67_EPWM_TBCTL_OFFSET, tbctl);
+      am67_epwm_putreg16(base, AM67_EPWM_TBPRD_OFFSET, tbprd);
+      am67_epwm_putreg16(base, AM67_EPWM_TBPHS_OFFSET, 0);
+      am67_epwm_putreg16(base, AM67_EPWM_TBCNT_OFFSET, 0);
+      am67_epwm_putreg16(base, AM67_EPWM_CMPCTL_OFFSET, 0);
+      am67_epwm_putreg16(base, AM67_EPWM_CMPA_OFFSET, tbprd / 2);
+      am67_epwm_putreg16(base, AM67_EPWM_CMPB_OFFSET, tbprd / 2);
+
+      /* High at CTR = 0, low at the compare, nothing at PRD */
+
+      am67_epwm_putreg16(base, AM67_EPWM_AQCTLA_OFFSET,
+                         (AM67_EPWM_AQ_SET << 0) | (AM67_EPWM_AQ_CLEAR << 4));
+      am67_epwm_putreg16(base, AM67_EPWM_AQCTLB_OFFSET,
+                         (AM67_EPWM_AQ_SET << 0) | (AM67_EPWM_AQ_CLEAR << 8));
+
+      am67_epwm_putreg16(base, AM67_EPWM_ETSEL_OFFSET,
+                         AM67_EPWM_ETSEL_INTSEL_ZERO);
+      am67_epwm_putreg16(base, AM67_EPWM_ETPS_OFFSET,
+                         AM67_EPWM_ETPS_INTPRD_1);
+      am67_epwm_putreg16(base, AM67_EPWM_ETCLR_OFFSET, AM67_EPWM_ET_INT);
+
+      priv->frequency = 0;
+      priv->tbprd = tbprd;
+      priv->active_channels = CH_A_ACTIVE | CH_B_ACTIVE;
+    }
+
+  /* Start EPWM1 first so the first EPWM0 SYNCOUT aligns it */
+
+  for (n = 1; n >= 0; n--)
+    {
+      uint32_t base = epwm[n]->base;
+
+      am67_epwm_putreg16(base, AM67_EPWM_TBCTL_OFFSET,
+                         (am67_epwm_getreg16(base, AM67_EPWM_TBCTL_OFFSET) &
+                          ~AM67_EPWM_TBCTL_CTRMODE_MASK) |
+                         (AM67_EPWM_TBCTL_CTRMODE_UP <<
+                          AM67_EPWM_TBCTL_CTRMODE_SHIFT));
+    }
+
+  /* From now on the force loads at PRD; it stays low until a frame */
+
+  for (n = 0; n < 2; n++)
+    {
+      am67_epwm_putreg16(epwm[n]->base, AM67_EPWM_AQSFRC_OFFSET,
+                         AM67_EPWM_AQSFRC_RLDCSF_PERIOD <<
+                         AM67_EPWM_AQSFRC_RLDCSF_SHIFT);
+      am67_epwm_putreg16(epwm[n]->base, AM67_EPWM_AQCSFRC_OFFSET,
+                         (AM67_EPWM_CSFA_FORCE_LOW << 0) |
+                         (AM67_EPWM_CSFA_FORCE_LOW << 2));
+    }
+
+  return OK;
 }
 
 /****************************************************************************

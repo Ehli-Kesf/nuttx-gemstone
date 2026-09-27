@@ -90,6 +90,17 @@
 #define AM67_EPWM_AQSFRC_OFFSET         0x01a
 #define AM67_EPWM_AQCSFRC_OFFSET        0x01c
 
+/* Event trigger (used by DShot: interrupt at CTR = 0) */
+
+#define AM67_EPWM_ETSEL_OFFSET          0x032
+#define AM67_EPWM_ETPS_OFFSET           0x034
+#define AM67_EPWM_ETFLG_OFFSET          0x036
+#define AM67_EPWM_ETCLR_OFFSET          0x038
+#define AM67_EPWM_ETSEL_INTSEL_ZERO     (1u << 0)   /* event at CTR = 0 */
+#define AM67_EPWM_ETSEL_INTEN           (1u << 3)
+#define AM67_EPWM_ETPS_INTPRD_1         (1u << 0)   /* every event */
+#define AM67_EPWM_ET_INT                (1u << 0)
+
 /* Register bit field definitions *******************************************/
 
 /* Time-Base Control Register (TBCTL) */
@@ -154,6 +165,7 @@
 #define AM67_EPWM_AQCSFRC_CSFB_MASK                     (3u << 2)
 #define AM67_EPWM_AQSFRC_RLDCSF_SHIFT                   (6)
 #define AM67_EPWM_AQSFRC_RLDCSF_MASK                    (3u << 6)
+#define AM67_EPWM_AQSFRC_RLDCSF_PERIOD                  (1)
 #define AM67_EPWM_AQSFRC_RLDCSF_IMMEDIATE               (3)
 
 #endif /* __ARCH_ARM_SRC_AM67_AM67_PWM_HW_H */

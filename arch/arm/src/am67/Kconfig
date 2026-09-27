@@ -102,6 +102,17 @@ config AM67_RTI8_WDT
 		in g_am67_wdt_fiq_info and halts the core. The caller starts and
 		kicks it (am67_rti.h).
 
+config AM67_DSHOT
+	bool "AM67 DShot on the EPWM motor outputs (FIQ bit engine)"
+	default n
+	depends on AM67_EPWM0 && AM67_EPWM1
+	select ARMV7R_DECODEFIQ
+	select ARMV7R_FIQ_NMI
+	---help---
+		DShot150/300/600 on EPWM0 A/B and EPWM1 A/B. Each counter
+		period is one bit with shadowed compares; a FIQ at CTR = 0
+		(EPWM0 event trigger, VIM 36) writes the next bit from ATCM.
+
 config AM67_I2C
 	bool "AM67 I2C support"
 	default n

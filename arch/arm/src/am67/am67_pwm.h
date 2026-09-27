@@ -110,5 +110,9 @@ struct pwm_lowerhalf_s *am67_epwminitialize(int pwm);
 
 void am67_epwm_emergency_stop(void);
 
+/* Put EPWM0 and EPWM1 in DShot bit mode (see am67_dshot.c) */
+
+int am67_epwm_dshot_setup(uint16_t tbprd);
+
 #endif /* CONFIG_AM67_EPWM0 || CONFIG_AM67_EPWM1 */
 #endif /* __ARCH_ARM_SRC_AM67_AM67_PWM_H */
