@@ -188,6 +188,17 @@ static volatile bool g_am67_rptun_lockout;
 
 static sem_t g_am67_rptun_stopsem = SEM_INITIALIZER(0);
 
+/* What woke the halted core, for Linux to read (ATCM, not cached;
+ * scripts/kart/r5f-inspect.sh halt): [0] magic "HALT", [1] WFI wake-ups,
+ * [2] VIM PRIIRQ, [3] VIM PRIFIQ at the last wake-up, [4] first VIM group
+ * with a raw pending input, [5] its raw bits, [6] CPSR.
+ */
+
+#define AM67_HALT_MAGIC  0x544c4148u   /* "HALT" */
+#define VIM_BASE         0x2fff0000u
+
+locate_data(".am67_fastdata") volatile uint32_t g_am67_halt_diag[8];
+
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
@@ -358,12 +369,38 @@ static void am67_rptun_shutdown(void)
       up_disable_irq(irq);
     }
 
+  g_am67_halt_diag[1] = 0;
+  g_am67_halt_diag[0] = AM67_HALT_MAGIC;
+
   putreg32(RP_MBOX_SHUTDOWN_ACK, AM67_MBOX_MESSAGE(AM67_MBOX_TX_FIFO));
   UP_DSB();
 
   for (; ; )
     {
+      uint32_t cpsr;
+      int g;
+
       asm volatile ("wfi");
+
+      /* Linux wants the core to stay in WFI: record why it did not */
+
+      g_am67_halt_diag[1]++;
+      g_am67_halt_diag[2] = getreg32(VIM_BASE + 0x08);
+      g_am67_halt_diag[3] = getreg32(VIM_BASE + 0x0c);
+      for (g = 0; g < 16; g++)
+        {
+          uint32_t raw = getreg32(VIM_BASE + 0x400 + g * 0x20);
+
+          if (raw != 0)
+            {
+              g_am67_halt_diag[4] = g;
+              g_am67_halt_diag[5] = raw;
+              break;
+            }
+        }
+
+      asm volatile ("mrs %0, cpsr" : "=r" (cpsr));
+      g_am67_halt_diag[6] = cpsr;
     }
 }
 
