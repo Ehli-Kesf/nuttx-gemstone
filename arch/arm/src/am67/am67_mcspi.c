@@ -92,8 +92,10 @@ struct am67_mcspi_dev_s
   uint32_t         chconf;
   uint32_t         chctrl;
   bool             selected;
+  bool             shifting;   /* words shifted since the last EOT wait */
   uint32_t         errors;     /* Failures since am67_mcspi_take_errors() */
   uint32_t         reset_at;   /* errors when the controller was last reset */
+  struct am67_mcspi_stats_s stats;
 };
 
 /****************************************************************************
@@ -221,12 +223,14 @@ static void am67_mcspi_cs_force(FAR struct am67_mcspi_dev_s *priv,
        * truncates writes (e.g. the ICM-20948 bank-switch).
        */
 
-      if (!am67_mcspi_waitstat(priv->base, priv->channel,
+      if (priv->shifting &&
+          !am67_mcspi_waitstat(priv->base, priv->channel,
                                AM67_MCSPI_CHSTAT_EOT))
         {
           priv->errors++;
         }
 
+      priv->shifting = false;
       chconf &= ~AM67_MCSPI_CHCONF_FORCE;  /* FORCE=0: CS deasserted (high) */
     }
   else
@@ -495,6 +499,7 @@ static bool am67_mcspi_transfer_word(FAR struct am67_mcspi_dev_s *priv,
     }
 
   am67_mcspi_putreg(priv->base, AM67_MCSPI_TX0 + choff, wd);
+  priv->shifting = true;
 
   if (!am67_mcspi_waitstat(priv->base, priv->channel,
                            AM67_MCSPI_CHSTAT_RXS))
@@ -529,9 +534,11 @@ static uint32_t am67_mcspi_setfrequency(FAR struct spi_dev_s *dev,
                                         uint32_t frequency)
 {
   FAR struct am67_mcspi_dev_s *priv = am67_mcspi_dev(dev);
+  uint32_t start = (uint32_t)up_perf_gettime();
 
   priv->frequency = frequency;
   am67_mcspi_apply_hwconfig(priv);
+  priv->stats.config_cycles += (uint32_t)up_perf_gettime() - start;
   return priv->frequency;
 }
 
@@ -539,23 +546,28 @@ static void am67_mcspi_setmode(FAR struct spi_dev_s *dev,
                                enum spi_mode_e mode)
 {
   FAR struct am67_mcspi_dev_s *priv = am67_mcspi_dev(dev);
+  uint32_t start = (uint32_t)up_perf_gettime();
 
   priv->mode = (uint8_t)mode;
   am67_mcspi_apply_hwconfig(priv);
+  priv->stats.config_cycles += (uint32_t)up_perf_gettime() - start;
 }
 
 static void am67_mcspi_setbits(FAR struct spi_dev_s *dev, int nbits)
 {
   FAR struct am67_mcspi_dev_s *priv = am67_mcspi_dev(dev);
+  uint32_t start = (uint32_t)up_perf_gettime();
 
   DEBUGASSERT(nbits == 8 || nbits == 16);
   priv->nbits = (uint8_t)nbits;
   am67_mcspi_apply_hwconfig(priv);
+  priv->stats.config_cycles += (uint32_t)up_perf_gettime() - start;
 }
 
 static uint32_t am67_mcspi_send(FAR struct spi_dev_s *dev, uint32_t wd)
 {
   FAR struct am67_mcspi_dev_s *priv = am67_mcspi_dev(dev);
+  uint32_t start = (uint32_t)up_perf_gettime();
   uint32_t rd = 0;
 
   if (!priv->selected)
@@ -565,23 +577,129 @@ static uint32_t am67_mcspi_send(FAR struct spi_dev_s *dev, uint32_t wd)
     }
 
   am67_mcspi_transfer_word(priv, wd, &rd);
+  priv->stats.words++;
+  priv->stats.xfer_cycles += (uint32_t)up_perf_gettime() - start;
   return rd;
 }
 
 #ifdef CONFIG_SPI_EXCHANGE
-static void am67_mcspi_exchange(FAR struct spi_dev_s *dev,
-                                FAR const void *txbuffer,
-                                FAR void *rxbuffer, size_t nwords)
+/* Full-duplex 8-bit transfer through the FIFO in turbo mode, so the words
+ * go out back to back instead of waiting for a status round trip per byte
+ * (each MCU-domain register access costs ~200 ns, a byte at 6.9 MHz
+ * 1.2 us). At most one FIFO half (32 bytes) is in flight: the transmit
+ * half then never fills and the receive half cannot overflow, so only the
+ * receive status has to be polled. Returns false if no byte arrived for
+ * AM67_MCSPI_TIMEOUT_US.
+ */
+
+static bool am67_mcspi_exchange_fifo(FAR struct am67_mcspi_dev_s *priv,
+                                     FAR const uint8_t *tx8,
+                                     FAR uint8_t *rx8, size_t nwords)
 {
-  FAR struct am67_mcspi_dev_s *priv = am67_mcspi_dev(dev);
+  const uint32_t choff = AM67_MCSPI_CH_OFFSET(priv->channel);
+  const uint32_t stat = priv->base + AM67_MCSPI_CHSTAT0 + choff;
+  const uint32_t txreg = priv->base + AM67_MCSPI_TX0 + choff;
+  const uint32_t rxreg = priv->base + AM67_MCSPI_RX0 + choff;
+  const uint32_t chconf = priv->chconf;
+  uint32_t progress;
+  size_t tx = 0;
+  size_t rx = 0;
+  bool ok = true;
+
+  /* The word count must be set before the channel is enabled, which also
+   * resets the FIFO pointers. CS stays asserted: FORCE is kept.
+   */
+
+  am67_mcspi_channel_enable(priv, false);
+  am67_mcspi_putreg(priv->base, AM67_MCSPI_XFERLEVEL,
+                    (uint32_t)nwords << AM67_MCSPI_XFERLEVEL_WCNT_SHIFT);
+  am67_mcspi_putreg(priv->base, AM67_MCSPI_CHCONF0 + choff,
+                    chconf | AM67_MCSPI_CHCONF_FFEW |
+                    AM67_MCSPI_CHCONF_FFER | AM67_MCSPI_CHCONF_TURBO);
+  am67_mcspi_channel_enable(priv, true);
+
+  while (tx < nwords && tx < AM67_MCSPI_FIFO_HALF)
+    {
+      putreg32(tx8 != NULL ? tx8[tx] : 0xffu, txreg);
+      tx++;
+    }
+
+  progress = (uint32_t)up_perf_gettime();
+
+  while (rx < nwords)
+    {
+      uint32_t st = getreg32(stat);
+
+      /* The last word is not moved into the FIFO: it stays in RX0 with
+       * RXS set and RXFFE still set (seen on the O1, 2026-09-28; the
+       * Linux omap2-mcspi driver reads it the same way).
+       */
+
+      if ((st & AM67_MCSPI_CHSTAT_RXFFE) == 0 ||
+          (rx == nwords - 1 && (st & AM67_MCSPI_CHSTAT_RXS) != 0))
+        {
+          uint32_t rd = getreg32(rxreg);
+
+          if (rx8 != NULL)
+            {
+              rx8[rx] = (uint8_t)rd;
+            }
+
+          rx++;
+
+          if (tx < nwords)
+            {
+              putreg32(tx8 != NULL ? tx8[tx] : 0xffu, txreg);
+              tx++;
+            }
+
+          progress = (uint32_t)up_perf_gettime();
+        }
+      else if ((uint32_t)up_perf_gettime() - progress >
+               AM67_MCSPI_TIMEOUT_CYCLES)
+        {
+          spierr("ERROR: FIFO timeout ch%u %zu/%zu\n", priv->channel,
+                 rx, nwords);
+          priv->stats.fifo_stalls++;
+          priv->stats.fail_stat = getreg32(stat);
+          priv->stats.fail_rx = rx;
+          priv->errors++;
+          ok = false;
+          break;
+        }
+    }
+
+  /* Every word was received, so the shift register is idle; confirm it
+   * before CS can be released.
+   */
+
+  if (ok && !am67_mcspi_waitstat(priv->base, priv->channel,
+                                 AM67_MCSPI_CHSTAT_EOT))
+    {
+      priv->stats.eot_timeouts++;
+      priv->stats.fail_stat = getreg32(stat);
+      priv->stats.fail_rx = rx;
+      priv->errors++;
+      ok = false;
+    }
+
+  /* Back to FIFO-less mode, channel enabled and CS still asserted, as the
+   * word-at-a-time path expects.
+   */
+
+  am67_mcspi_channel_enable(priv, false);
+  am67_mcspi_putreg(priv->base, AM67_MCSPI_CHCONF0 + choff, chconf);
+  am67_mcspi_putreg(priv->base, AM67_MCSPI_XFERLEVEL, 0);
+  am67_mcspi_channel_enable(priv, true);
+  return ok;
+}
+
+static void am67_mcspi_exchange_words(FAR struct am67_mcspi_dev_s *priv,
+                                      FAR const void *txbuffer,
+                                      FAR void *rxbuffer, size_t nwords)
+{
   uint32_t rd;
   size_t i;
-
-  if (!priv->selected)
-    {
-      priv->errors++;
-      return;
-    }
 
   if (priv->nbits > 8)
     {
@@ -624,6 +742,41 @@ static void am67_mcspi_exchange(FAR struct spi_dev_s *dev,
         }
     }
 }
+
+static void am67_mcspi_exchange(FAR struct spi_dev_s *dev,
+                                FAR const void *txbuffer,
+                                FAR void *rxbuffer, size_t nwords)
+{
+  FAR struct am67_mcspi_dev_s *priv = am67_mcspi_dev(dev);
+  uint32_t start = (uint32_t)up_perf_gettime();
+  uint32_t cycles;
+
+  if (!priv->selected)
+    {
+      priv->errors++;
+      return;
+    }
+
+  if (priv->nbits == 8 && nwords > 1 &&
+      nwords <= AM67_MCSPI_XFERLEVEL_WCNT_MAX)
+    {
+      am67_mcspi_exchange_fifo(priv, txbuffer, rxbuffer, nwords);
+    }
+  else
+    {
+      am67_mcspi_exchange_words(priv, txbuffer, rxbuffer, nwords);
+    }
+
+  cycles = (uint32_t)up_perf_gettime() - start;
+  priv->stats.words += nwords;
+  priv->stats.xfer_cycles += cycles;
+
+  if (cycles > priv->stats.max_xfer_cycles)
+    {
+      priv->stats.max_xfer_cycles = cycles;
+      priv->stats.max_xfer_words = nwords;
+    }
+}
 #endif
 
 /****************************************************************************
@@ -657,6 +810,7 @@ void am67_mcspi_board_select(FAR struct spi_dev_s *dev, uint8_t channel,
                              bool selected)
 {
   FAR struct am67_mcspi_dev_s *priv = am67_mcspi_dev(dev);
+  uint32_t start = (uint32_t)up_perf_gettime();
 
   if (selected)
     {
@@ -680,7 +834,11 @@ void am67_mcspi_board_select(FAR struct spi_dev_s *dev, uint8_t channel,
           am67_mcspi_controller_init(priv);
           priv->reset_at = priv->errors;
         }
+
+      priv->stats.transfers++;
     }
+
+  priv->stats.select_cycles += (uint32_t)up_perf_gettime() - start;
 }
 
 int am67_mcspi_take_errors(FAR struct spi_dev_s *dev)
@@ -691,6 +849,19 @@ int am67_mcspi_take_errors(FAR struct spi_dev_s *dev)
   priv->errors = 0;
   priv->reset_at = 0;
   return errors > INT_MAX ? INT_MAX : (int)errors;
+}
+
+void am67_mcspi_stats(FAR struct spi_dev_s *dev,
+                      FAR struct am67_mcspi_stats_s *stats, bool reset)
+{
+  FAR struct am67_mcspi_dev_s *priv = am67_mcspi_dev(dev);
+
+  *stats = priv->stats;
+
+  if (reset)
+    {
+      memset(&priv->stats, 0, sizeof(priv->stats));
+    }
 }
 
 #endif /* CONFIG_AM67_MCSPI0 */
