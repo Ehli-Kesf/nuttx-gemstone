@@ -167,6 +167,10 @@ static const struct spi_ops_s g_am67_spi0ops =
 #endif
 };
 
+#ifdef CONFIG_AM67_FAULT_INJECTION
+static volatile unsigned int g_am67_mcspi_inject;
+#endif
+
 static struct am67_mcspi_dev_s g_spi0dev =
 {
   .spidev =
@@ -830,6 +834,16 @@ static bool am67_mcspi_exchange_fifo(FAR struct am67_mcspi_dev_s *priv,
   x->rx = 0;
   x->ok = false;
 
+  bool inject = false;
+
+#ifdef CONFIG_AM67_FAULT_INJECTION
+  if (g_am67_mcspi_inject > 0)
+    {
+      g_am67_mcspi_inject--;
+      inject = true;
+    }
+#endif
+
   if (use_irq)
     {
       level |= (AM67_MCSPI_IRQ_BLOCK - 1u) << AM67_MCSPI_XFERLEVEL_AFL_SHIFT;
@@ -854,14 +868,23 @@ static bool am67_mcspi_exchange_fifo(FAR struct am67_mcspi_dev_s *priv,
       am67_mcspi_putreg(priv->base, AM67_MCSPI_IRQSTATUS,
                         AM67_MCSPI_IRQ_ALL);
       x->active = true;
-      am67_mcspi_putreg(priv->base, AM67_MCSPI_IRQENABLE,
-                        AM67_MCSPI_IRQ_RX_FULL(priv->channel) |
-                        AM67_MCSPI_IRQ_EOW);
+
+      /* Fault injection: the interrupt is never enabled (lost interrupt) */
+
+      if (!inject)
+        {
+          am67_mcspi_putreg(priv->base, AM67_MCSPI_IRQENABLE,
+                            AM67_MCSPI_IRQ_RX_FULL(priv->channel) |
+                            AM67_MCSPI_IRQ_EOW);
+        }
     }
 
   am67_mcspi_channel_enable(priv, true);
 
-  while (x->tx < nwords && x->tx < AM67_MCSPI_FIFO_HALF)
+  /* Fault injection on the polled path: nothing is sent */
+
+  while (x->tx < nwords && x->tx < AM67_MCSPI_FIFO_HALF &&
+         !(inject && !use_irq))
     {
       am67_mcspi_fifo_push(priv, txreg);
     }
@@ -1080,5 +1103,12 @@ void am67_mcspi_stats(FAR struct spi_dev_s *dev,
       memset(&priv->stats, 0, sizeof(priv->stats));
     }
 }
+
+#ifdef CONFIG_AM67_FAULT_INJECTION
+void am67_mcspi_inject_fault(unsigned int count)
+{
+  g_am67_mcspi_inject = count;
+}
+#endif
 
 #endif /* CONFIG_AM67_MCSPI0 */

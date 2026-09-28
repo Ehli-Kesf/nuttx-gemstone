@@ -184,4 +184,12 @@ struct am67_mcspi_stats_s
 void am67_mcspi_stats(FAR struct spi_dev_s *dev,
                       FAR struct am67_mcspi_stats_s *stats, bool reset);
 
+#ifdef CONFIG_AM67_FAULT_INJECTION
+/* Make the next count FIFO transfers stall (no words sent, or the
+ * interrupt never enabled), so that they time out. Bench tests only.
+ */
+
+void am67_mcspi_inject_fault(unsigned int count);
+#endif
+
 #endif /* __ARCH_ARM_SRC_AM67_AM67_MCSPI_H */

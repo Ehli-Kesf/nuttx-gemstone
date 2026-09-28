@@ -387,6 +387,32 @@ static void sdhci_endwait(struct am67_sdhci_s *priv,
     }
 }
 
+#ifdef CONFIG_AM67_FAULT_INJECTION
+static volatile unsigned int g_sdhci_inject_mode;
+static volatile unsigned int g_sdhci_inject_count;
+
+void am67_sdhci_inject_fault(unsigned int mode, unsigned int count)
+{
+  g_sdhci_inject_mode = mode;
+  g_sdhci_inject_count = count;
+}
+
+/* Take one injected fault of this mode, if any is pending */
+
+static bool sdhci_inject(unsigned int mode)
+{
+  if (g_sdhci_inject_count > 0 && g_sdhci_inject_mode == mode)
+    {
+      g_sdhci_inject_count--;
+      return true;
+    }
+
+  return false;
+}
+#else
+#  define sdhci_inject(mode) false
+#endif
+
 /* Move whole blocks between the buffer and the data port, in the waiting
  * thread with interrupts enabled. Each 512-byte block is 128 register
  * accesses (18-25 us); in the interrupt handler a multi-block write kept
@@ -402,6 +428,13 @@ static void sdhci_pio(struct am67_sdhci_s *priv)
   size_t remaining;
   bool reading;
   irqstate_t flags;
+
+  /* Fault injection: drop the buffer-ready event, the wait times out */
+
+  if (sdhci_inject(1))
+    {
+      return;
+    }
 
   flags = enter_critical_section();
   buffer = priv->buffer;
@@ -954,7 +987,7 @@ static sdio_eventset_t sdhci_eventwait(struct sdio_dev_s *dev)
 
       if (event == 0 && tc && !pio)
         {
-          sdhci_endwait(priv, priv->remaining == 0 ?
+          sdhci_endwait(priv, priv->remaining == 0 && !sdhci_inject(2) ?
                         SDIOWAIT_TRANSFERDONE : SDIOWAIT_ERROR);
           event = priv->wkupevent;
         }

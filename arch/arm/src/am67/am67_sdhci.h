@@ -36,5 +36,14 @@ struct sdio_dev_s;
 
 struct sdio_dev_s *am67_sdhci0_initialize(void);
 
+#ifdef CONFIG_AM67_FAULT_INJECTION
+/* Make the next count data transfers fail: mode 1 stalls them (no data
+ * moved, the wait times out), mode 2 reports an error at transfer
+ * complete. Bench tests only.
+ */
+
+void am67_sdhci_inject_fault(unsigned int mode, unsigned int count);
+#endif
+
 #endif /* CONFIG_AM67_SDHCI0 */
 #endif /* __ARCH_ARM_SRC_AM67_AM67_SDHCI_H */

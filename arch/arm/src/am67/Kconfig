@@ -123,6 +123,14 @@ config AM67_SDHCI0
 		drivers/mmcsd: 4-bit, legacy timing at 20 MHz, programmed I/O.
 		Linux must leave sdhci0 disabled.
 
+config AM67_FAULT_INJECTION
+	bool "Driver fault injection for bench tests"
+	default n
+	---help---
+		Lets a test command make MCSPI and SDHCI transfers fail on
+		request, to exercise their error and recovery paths on the bench.
+		Never enable in a flight image.
+
 config AM67_I2C
 	bool "AM67 I2C support"
 	default n
