@@ -417,13 +417,17 @@ static int am67_ecap_setup(struct pwm_lowerhalf_s *dev)
   struct am67_ecap_s *priv = (struct am67_ecap_s *)dev;
   int ret;
 
-  /* Check the PID before any other register access */
+  /* Check the PID before any other register access. The caller powers
+   * the module first (TISCI); an unpowered or unassigned module reads 0 or
+   * all ones and must fail the open instead of looking healthy while its
+   * output stays silent.
+   */
 
-  // ret = am67_ecap_check_pid(priv->base);
-  // if (ret < 0)
-  //   {
-  //     return ret;
-  //   }
+  ret = am67_ecap_check_pid(priv->base);
+  if (ret < 0)
+    {
+      return ret;
+    }
 
   am67_ecap_pinmux_init(priv->pinmux_id);
 
