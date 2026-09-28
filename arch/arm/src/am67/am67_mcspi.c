@@ -36,11 +36,14 @@
 
 #include <nuttx/arch.h>
 #include <nuttx/mutex.h>
+#include <nuttx/irq.h>
+#include <nuttx/semaphore.h>
 #include <nuttx/spi/spi.h>
 #include <syslog.h>
 
 #include "am67_mcspi.h"
 #include "am67_pinmux.h"
+#include "arm.h"
 #include "arm_internal.h"
 #include "sctlr.h"
 
@@ -76,9 +79,37 @@ uint8_t am67_spi0status(FAR struct spi_dev_s *dev, uint32_t devid);
 
 #define AM67_MCSPI_POLL_MAX         1000000u
 
+/* FIFO transfers longer than one FIFO half are driven by the interrupt:
+ * the receive half raises RXi_FULL every AM67_MCSPI_IRQ_BLOCK bytes and
+ * the handler moves exactly that many bytes each way; the tail is read on
+ * end of word count. The thread sleeps in between instead of polling for
+ * the wire time.
+ */
+
+#define AM67_MCSPI_IRQ_BLOCK        16u
+
+/* Wait for an interrupt-driven transfer. The longest one (FIFO read of
+ * the ICM-20948, 267 bytes) takes 0.4 ms; the system tick is 10 ms.
+ */
+
+#define AM67_MCSPI_IRQ_TIMEOUT_TICKS 3
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
+
+/* A FIFO transfer in progress, shared with the interrupt handler */
+
+struct am67_mcspi_xfer_s
+{
+  FAR const uint8_t *tx8;
+  FAR uint8_t       *rx8;
+  size_t             nwords;
+  size_t             tx;       /* words written to TX */
+  size_t             rx;       /* words read from RX */
+  volatile bool      active;   /* the interrupt handler owns the transfer */
+  volatile bool      ok;       /* result, valid once !active */
+};
 
 struct am67_mcspi_dev_s
 {
@@ -95,6 +126,9 @@ struct am67_mcspi_dev_s
   bool             shifting;   /* words shifted since the last EOT wait */
   uint32_t         errors;     /* Failures since am67_mcspi_take_errors() */
   uint32_t         reset_at;   /* errors when the controller was last reset */
+  struct am67_mcspi_xfer_s xfer;
+  sem_t            xfer_sem;   /* posted when an interrupt transfer ends */
+  bool             irq_ready;  /* interrupt attached */
   struct am67_mcspi_stats_s stats;
 };
 
@@ -141,6 +175,7 @@ static struct am67_mcspi_dev_s g_spi0dev =
     },
   .base       = AM67_MCSPI0_BASE,
   .lock       = NXMUTEX_INITIALIZER,
+  .xfer_sem   = SEM_INITIALIZER(0),
   .channel    = 0,
   .frequency  = 1000000,
   .mode       = SPIDEV_MODE3,
@@ -583,74 +618,59 @@ static uint32_t am67_mcspi_send(FAR struct spi_dev_s *dev, uint32_t wd)
 }
 
 #ifdef CONFIG_SPI_EXCHANGE
-/* Full-duplex 8-bit transfer through the FIFO in turbo mode, so the words
- * go out back to back instead of waiting for a status round trip per byte
- * (each MCU-domain register access costs ~200 ns, a byte at 6.9 MHz
- * 1.2 us). At most one FIFO half (32 bytes) is in flight: the transmit
- * half then never fills and the receive half cannot overflow, so only the
- * receive status has to be polled. Returns false if no byte arrived for
- * AM67_MCSPI_TIMEOUT_US.
+static inline void am67_mcspi_fifo_push(FAR struct am67_mcspi_dev_s *priv,
+                                        uint32_t txreg)
+{
+  FAR struct am67_mcspi_xfer_s *x = &priv->xfer;
+
+  putreg32(x->tx8 != NULL ? x->tx8[x->tx] : 0xffu, txreg);
+  x->tx++;
+}
+
+static inline void am67_mcspi_fifo_pop(FAR struct am67_mcspi_dev_s *priv,
+                                       uint32_t rxreg)
+{
+  FAR struct am67_mcspi_xfer_s *x = &priv->xfer;
+  uint32_t rd = getreg32(rxreg);
+
+  if (x->rx8 != NULL)
+    {
+      x->rx8[x->rx] = (uint8_t)rd;
+    }
+
+  x->rx++;
+}
+
+/* Receive until every word is in, queueing one more word per word
+ * received. Only the receive status is polled: at most one FIFO half
+ * (32 bytes) is in flight, so the transmit half never fills and the
+ * receive half cannot overflow. In turbo mode the last word is not moved
+ * into the FIFO: it stays in RX0 with RXS set and RXFFE still set (seen on
+ * the O1, 2026-09-28; the Linux omap2-mcspi driver reads it the same way).
+ * Returns false if no word arrived for AM67_MCSPI_TIMEOUT_US.
  */
 
-static bool am67_mcspi_exchange_fifo(FAR struct am67_mcspi_dev_s *priv,
-                                     FAR const uint8_t *tx8,
-                                     FAR uint8_t *rx8, size_t nwords)
+static bool am67_mcspi_fifo_drain(FAR struct am67_mcspi_dev_s *priv)
 {
+  FAR struct am67_mcspi_xfer_s *x = &priv->xfer;
   const uint32_t choff = AM67_MCSPI_CH_OFFSET(priv->channel);
   const uint32_t stat = priv->base + AM67_MCSPI_CHSTAT0 + choff;
   const uint32_t txreg = priv->base + AM67_MCSPI_TX0 + choff;
   const uint32_t rxreg = priv->base + AM67_MCSPI_RX0 + choff;
-  const uint32_t chconf = priv->chconf;
-  uint32_t progress;
-  size_t tx = 0;
-  size_t rx = 0;
-  bool ok = true;
+  uint32_t progress = (uint32_t)up_perf_gettime();
 
-  /* The word count must be set before the channel is enabled, which also
-   * resets the FIFO pointers. CS stays asserted: FORCE is kept.
-   */
-
-  am67_mcspi_channel_enable(priv, false);
-  am67_mcspi_putreg(priv->base, AM67_MCSPI_XFERLEVEL,
-                    (uint32_t)nwords << AM67_MCSPI_XFERLEVEL_WCNT_SHIFT);
-  am67_mcspi_putreg(priv->base, AM67_MCSPI_CHCONF0 + choff,
-                    chconf | AM67_MCSPI_CHCONF_FFEW |
-                    AM67_MCSPI_CHCONF_FFER | AM67_MCSPI_CHCONF_TURBO);
-  am67_mcspi_channel_enable(priv, true);
-
-  while (tx < nwords && tx < AM67_MCSPI_FIFO_HALF)
-    {
-      putreg32(tx8 != NULL ? tx8[tx] : 0xffu, txreg);
-      tx++;
-    }
-
-  progress = (uint32_t)up_perf_gettime();
-
-  while (rx < nwords)
+  while (x->rx < x->nwords)
     {
       uint32_t st = getreg32(stat);
 
-      /* The last word is not moved into the FIFO: it stays in RX0 with
-       * RXS set and RXFFE still set (seen on the O1, 2026-09-28; the
-       * Linux omap2-mcspi driver reads it the same way).
-       */
-
       if ((st & AM67_MCSPI_CHSTAT_RXFFE) == 0 ||
-          (rx == nwords - 1 && (st & AM67_MCSPI_CHSTAT_RXS) != 0))
+          (x->rx == x->nwords - 1 && (st & AM67_MCSPI_CHSTAT_RXS) != 0))
         {
-          uint32_t rd = getreg32(rxreg);
+          am67_mcspi_fifo_pop(priv, rxreg);
 
-          if (rx8 != NULL)
+          if (x->tx < x->nwords)
             {
-              rx8[rx] = (uint8_t)rd;
-            }
-
-          rx++;
-
-          if (tx < nwords)
-            {
-              putreg32(tx8 != NULL ? tx8[tx] : 0xffu, txreg);
-              tx++;
+              am67_mcspi_fifo_push(priv, txreg);
             }
 
           progress = (uint32_t)up_perf_gettime();
@@ -658,15 +678,203 @@ static bool am67_mcspi_exchange_fifo(FAR struct am67_mcspi_dev_s *priv,
       else if ((uint32_t)up_perf_gettime() - progress >
                AM67_MCSPI_TIMEOUT_CYCLES)
         {
-          spierr("ERROR: FIFO timeout ch%u %zu/%zu\n", priv->channel,
-                 rx, nwords);
           priv->stats.fifo_stalls++;
-          priv->stats.fail_stat = getreg32(stat);
-          priv->stats.fail_rx = rx;
-          priv->errors++;
-          ok = false;
-          break;
+          priv->stats.fail_stat = st;
+          priv->stats.fail_rx = x->rx;
+          return false;
         }
+    }
+
+  return true;
+}
+
+/* MCU_MCSPI0 interrupt: RXi_FULL guarantees AM67_MCSPI_IRQ_BLOCK words in
+ * the receive FIFO, and the next one is raised only after exactly that
+ * many reads. End of word count means every word has been shifted: read
+ * the rest and wake the thread.
+ */
+
+static int am67_mcspi_interrupt(int irq, FAR void *context, FAR void *arg)
+{
+  FAR struct am67_mcspi_dev_s *priv = arg;
+  FAR struct am67_mcspi_xfer_s *x = &priv->xfer;
+  const uint32_t choff = AM67_MCSPI_CH_OFFSET(priv->channel);
+  const uint32_t txreg = priv->base + AM67_MCSPI_TX0 + choff;
+  const uint32_t rxreg = priv->base + AM67_MCSPI_RX0 + choff;
+  uint32_t status = am67_mcspi_getreg(priv->base, AM67_MCSPI_IRQSTATUS);
+  unsigned i;
+
+  am67_mcspi_putreg(priv->base, AM67_MCSPI_IRQSTATUS, status);
+
+  if (!x->active)
+    {
+      am67_mcspi_putreg(priv->base, AM67_MCSPI_IRQENABLE, 0);
+      return OK;
+    }
+
+  if ((status & AM67_MCSPI_IRQ_RX_FULL(priv->channel)) != 0)
+    {
+      /* The last word never enters the FIFO, so a full block always ends
+       * before it.
+       */
+
+      for (i = 0; i < AM67_MCSPI_IRQ_BLOCK && x->rx < x->nwords - 1; i++)
+        {
+          am67_mcspi_fifo_pop(priv, rxreg);
+
+          if (x->tx < x->nwords)
+            {
+              am67_mcspi_fifo_push(priv, txreg);
+            }
+        }
+    }
+
+  if ((status & AM67_MCSPI_IRQ_EOW) != 0)
+    {
+      x->ok = am67_mcspi_fifo_drain(priv);
+      am67_mcspi_putreg(priv->base, AM67_MCSPI_IRQENABLE, 0);
+      x->active = false;
+      nxsem_post(&priv->xfer_sem);
+    }
+
+  return OK;
+}
+
+/* The interrupt path needs a thread that may sleep: not an interrupt
+ * handler and not a caller that masked IRQs (e.g. a LOCK_PREEMPTION
+ * device).
+ */
+
+static bool am67_mcspi_can_sleep(FAR struct am67_mcspi_dev_s *priv)
+{
+  irqstate_t flags;
+
+  if (!priv->irq_ready || up_interrupt_context())
+    {
+      return false;
+    }
+
+  flags = up_irq_save();
+  up_irq_restore(flags);
+  return (flags & PSR_I_BIT) == 0;
+}
+
+/* Wait for the interrupt handler to finish the transfer. On a timeout
+ * take the transfer back: mask the interrupt, then drop a completion that
+ * may have been posted meanwhile so it cannot end the next transfer.
+ */
+
+static bool am67_mcspi_fifo_wait(FAR struct am67_mcspi_dev_s *priv)
+{
+  FAR struct am67_mcspi_xfer_s *x = &priv->xfer;
+  irqstate_t flags;
+  int ret;
+
+  do
+    {
+      ret = nxsem_tickwait(&priv->xfer_sem, AM67_MCSPI_IRQ_TIMEOUT_TICKS);
+    }
+  while (ret == -EINTR);
+
+  flags = enter_critical_section();
+  am67_mcspi_putreg(priv->base, AM67_MCSPI_IRQENABLE, 0);
+
+  if (x->active)
+    {
+      x->active = false;
+      x->ok = false;
+      priv->stats.irq_timeouts++;
+      priv->stats.fail_rx = x->rx;
+    }
+
+  while (nxsem_trywait(&priv->xfer_sem) == 0)
+    {
+    }
+
+  leave_critical_section(flags);
+
+  if (x->ok)
+    {
+      priv->stats.irq_xfers++;
+    }
+
+  return x->ok;
+}
+
+/* Full-duplex 8-bit transfer through the FIFO in turbo mode, so the words
+ * go out back to back instead of waiting for a status round trip per byte
+ * (each MCU-domain register access costs ~200 ns, a byte at 6.9 MHz
+ * 1.2 us). Up to one FIFO half is queued first; transfers longer than
+ * that continue in the interrupt handler when the caller can sleep, else
+ * by polling.
+ */
+
+static bool am67_mcspi_exchange_fifo(FAR struct am67_mcspi_dev_s *priv,
+                                     FAR const uint8_t *tx8,
+                                     FAR uint8_t *rx8, size_t nwords)
+{
+  FAR struct am67_mcspi_xfer_s *x = &priv->xfer;
+  const uint32_t choff = AM67_MCSPI_CH_OFFSET(priv->channel);
+  const uint32_t txreg = priv->base + AM67_MCSPI_TX0 + choff;
+  const uint32_t chconf = priv->chconf;
+  const bool use_irq = nwords > AM67_MCSPI_FIFO_HALF &&
+                       am67_mcspi_can_sleep(priv);
+  uint32_t level = (uint32_t)nwords << AM67_MCSPI_XFERLEVEL_WCNT_SHIFT;
+  irqstate_t flags;
+  bool ok;
+
+  x->tx8 = tx8;
+  x->rx8 = rx8;
+  x->nwords = nwords;
+  x->tx = 0;
+  x->rx = 0;
+  x->ok = false;
+
+  if (use_irq)
+    {
+      level |= (AM67_MCSPI_IRQ_BLOCK - 1u) << AM67_MCSPI_XFERLEVEL_AFL_SHIFT;
+    }
+
+  /* The word count must be set before the channel is enabled, which also
+   * resets the FIFO pointers. CS stays asserted: FORCE is kept.
+   */
+
+  am67_mcspi_channel_enable(priv, false);
+  am67_mcspi_putreg(priv->base, AM67_MCSPI_XFERLEVEL, level);
+  am67_mcspi_putreg(priv->base, AM67_MCSPI_CHCONF0 + choff,
+                    chconf | AM67_MCSPI_CHCONF_FFEW |
+                    AM67_MCSPI_CHCONF_FFER | AM67_MCSPI_CHCONF_TURBO);
+
+  /* The handler must not run before the first half is queued */
+
+  flags = enter_critical_section();
+
+  if (use_irq)
+    {
+      am67_mcspi_putreg(priv->base, AM67_MCSPI_IRQSTATUS,
+                        AM67_MCSPI_IRQ_ALL);
+      x->active = true;
+      am67_mcspi_putreg(priv->base, AM67_MCSPI_IRQENABLE,
+                        AM67_MCSPI_IRQ_RX_FULL(priv->channel) |
+                        AM67_MCSPI_IRQ_EOW);
+    }
+
+  am67_mcspi_channel_enable(priv, true);
+
+  while (x->tx < nwords && x->tx < AM67_MCSPI_FIFO_HALF)
+    {
+      am67_mcspi_fifo_push(priv, txreg);
+    }
+
+  leave_critical_section(flags);
+
+  ok = use_irq ? am67_mcspi_fifo_wait(priv) : am67_mcspi_fifo_drain(priv);
+
+  if (!ok)
+    {
+      spierr("ERROR: FIFO transfer ch%u %zu/%zu\n", priv->channel,
+             x->rx, nwords);
+      priv->errors++;
     }
 
   /* Every word was received, so the shift register is idle; confirm it
@@ -677,8 +885,9 @@ static bool am67_mcspi_exchange_fifo(FAR struct am67_mcspi_dev_s *priv,
                                  AM67_MCSPI_CHSTAT_EOT))
     {
       priv->stats.eot_timeouts++;
-      priv->stats.fail_stat = getreg32(stat);
-      priv->stats.fail_rx = rx;
+      priv->stats.fail_stat = getreg32(priv->base + AM67_MCSPI_CHSTAT0 +
+                                       choff);
+      priv->stats.fail_rx = x->rx;
       priv->errors++;
       ok = false;
     }
@@ -791,6 +1000,14 @@ void am67_spiinitialize(void)
 
   am67_mcspi_controller_init(&g_spi0dev);
   am67_spi_pinmux_init();
+
+#ifdef CONFIG_SPI_EXCHANGE
+  if (irq_attach(AM67_MCSPI0_IRQ, am67_mcspi_interrupt, &g_spi0dev) == OK)
+    {
+      up_enable_irq(AM67_MCSPI0_IRQ);
+      g_spi0dev.irq_ready = true;
+    }
+#endif
   spiinfo("MCU_MCSPI0 @ 0x%08" PRIx32 " rev=0x%08" PRIx32 "\n",
           g_spi0dev.base,
           am67_mcspi_getreg(g_spi0dev.base, AM67_MCSPI_REVISION));

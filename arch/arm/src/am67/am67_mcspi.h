@@ -113,10 +113,19 @@
 #define AM67_MCSPI_CHSTAT_RXFFE     (1u << 5)
 #define AM67_MCSPI_CHSTAT_RXFFF     (1u << 6)
 
+/* IRQSTATUS/IRQENABLE: per channel TXi_EMPTY, TXi_UNDERFLOW, RXi_FULL at
+ * bits 4i, 4i+1, 4i+2; end of word count (FIFO transfers) at bit 17.
+ */
+
+#define AM67_MCSPI_IRQ_RX_FULL(ch)  (1u << (4u * (ch) + 2u))
+#define AM67_MCSPI_IRQ_EOW          (1u << 17)
+#define AM67_MCSPI_IRQ_ALL          0x0003ffffu
+
 /* XFERLEVEL: word count and almost-empty/almost-full levels */
 
 #define AM67_MCSPI_XFERLEVEL_WCNT_SHIFT 16
 #define AM67_MCSPI_XFERLEVEL_WCNT_MAX   0xffffu
+#define AM67_MCSPI_XFERLEVEL_AFL_SHIFT  8
 
 /* The 64-byte FIFO is split in two 32-byte halves when both directions
  * use it.
@@ -168,6 +177,8 @@ struct am67_mcspi_stats_s
   uint32_t eot_timeouts;     /* EOT not seen after a FIFO transfer */
   uint32_t fail_stat;        /* CHSTAT at the last failure */
   uint32_t fail_rx;          /* words received before it */
+  uint32_t irq_xfers;        /* FIFO transfers completed by the interrupt */
+  uint32_t irq_timeouts;     /* interrupt-driven transfers that timed out */
 };
 
 void am67_mcspi_stats(FAR struct spi_dev_s *dev,
