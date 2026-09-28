@@ -207,13 +207,17 @@ struct am67_sdhci_s
   worker_t callback;
   void *cbarg;
 
-  /* Current data transfer, driven by the interrupt handler */
+  /* Current data transfer. The interrupt handler only signals; the thread
+   * in sdhci_eventwait() moves the data and decides the result.
+   */
 
   uint8_t *buffer;
   size_t remaining;
   bool reading;
   uint16_t blocksize;
   uint16_t nblocks;
+  volatile bool piopending;     /* buffer ready, its interrupt masked */
+  volatile bool tcpending;      /* transfer complete seen */
 };
 
 /****************************************************************************
@@ -383,38 +387,74 @@ static void sdhci_endwait(struct am67_sdhci_s *priv,
     }
 }
 
-/* Move whole blocks between the buffer and the data port */
+/* Move whole blocks between the buffer and the data port, in the waiting
+ * thread with interrupts enabled. Each 512-byte block is 128 register
+ * accesses (18-25 us); in the interrupt handler a multi-block write kept
+ * interrupts off for up to ~1 ms. Works on local copies so that an error
+ * ending the transfer meanwhile (sdhci_endwait() from the handler) cannot
+ * pull the buffer from under it.
+ */
 
 static void sdhci_pio(struct am67_sdhci_s *priv)
 {
-  uint32_t bit = priv->reading ? PRSNT_BUFRDEN : PRSNT_BUFWREN;
+  uint32_t bit;
+  uint8_t *buffer;
+  size_t remaining;
+  bool reading;
+  irqstate_t flags;
 
-  while (priv->buffer != NULL && priv->remaining > 0 &&
+  flags = enter_critical_section();
+  buffer = priv->buffer;
+  remaining = priv->remaining;
+  reading = priv->reading;
+  leave_critical_section(flags);
+
+  bit = reading ? PRSNT_BUFRDEN : PRSNT_BUFWREN;
+
+  while (buffer != NULL && remaining > 0 &&
          (rd32(priv, SDHCI_PRSNT) & bit) != 0)
     {
-      size_t n = priv->blocksize < priv->remaining ?
-                 priv->blocksize : priv->remaining;
+      size_t n = priv->blocksize < remaining ? priv->blocksize : remaining;
       size_t i;
 
       for (i = 0; i < n; i += 4)
         {
           uint32_t word;
 
-          if (priv->reading)
+          if (reading)
             {
               word = rd32(priv, SDHCI_DATA);
-              memcpy(priv->buffer + i, &word, 4);
+              memcpy(buffer + i, &word, 4);
             }
           else
             {
-              memcpy(&word, priv->buffer + i, 4);
+              memcpy(&word, buffer + i, 4);
               wr32(priv, SDHCI_DATA, word);
             }
         }
 
-      priv->buffer += n;
-      priv->remaining -= n;
+      buffer += n;
+      remaining -= n;
     }
+
+  /* Unless the transfer ended meanwhile, record the progress and let the
+   * next buffer-ready interrupt through.
+   */
+
+  flags = enter_critical_section();
+  if (priv->buffer != NULL)
+    {
+      priv->buffer = buffer;
+      priv->remaining = remaining;
+
+      if (remaining > 0)
+        {
+          wr32(priv, SDHCI_INTSIGEN, rd32(priv, SDHCI_INTSIGEN) |
+                                     (reading ? INT_BRR : INT_BWR));
+        }
+    }
+
+  leave_critical_section(flags);
 }
 
 static int sdhci_interrupt(int irq, void *context, void *arg)
@@ -422,10 +462,18 @@ static int sdhci_interrupt(int irq, void *context, void *arg)
   struct am67_sdhci_s *priv = arg;
   uint32_t pending = rd32(priv, SDHCI_INTSTAT) & rd32(priv, SDHCI_INTSIGEN);
 
+  /* Buffer ready and transfer complete only wake the thread (see
+   * sdhci_pio()). The completion is judged there, after the thread has
+   * accounted for the last block.
+   */
+
   if ((pending & (INT_BRR | INT_BWR)) != 0)
     {
       wr32(priv, SDHCI_INTSTAT, pending & (INT_BRR | INT_BWR));
-      sdhci_pio(priv);
+      wr32(priv, SDHCI_INTSIGEN,
+           rd32(priv, SDHCI_INTSIGEN) & ~(INT_BRR | INT_BWR));
+      priv->piopending = true;
+      nxsem_post(&priv->waitsem);
     }
 
   if ((pending & INT_DATAERR) != 0)
@@ -437,8 +485,9 @@ static int sdhci_interrupt(int irq, void *context, void *arg)
   else if ((pending & INT_TC) != 0)
     {
       wr32(priv, SDHCI_INTSTAT, INT_TC);
-      sdhci_endwait(priv, priv->remaining == 0 ?
-                    SDIOWAIT_TRANSFERDONE : SDIOWAIT_ERROR);
+      wr32(priv, SDHCI_INTSIGEN, rd32(priv, SDHCI_INTSIGEN) & ~INT_TC);
+      priv->tcpending = true;
+      nxsem_post(&priv->waitsem);
     }
 
   return OK;
@@ -712,6 +761,8 @@ static int sdhci_xfersetup(struct am67_sdhci_s *priv, uint8_t *buffer,
   priv->buffer = buffer;
   priv->remaining = nbytes;
   priv->reading = reading;
+  priv->piopending = false;
+  priv->tcpending = false;
   wr32(priv, SDHCI_INTSTAT, INT_TC | INT_BRR | INT_BWR | INT_DATAERR);
   wr32(priv, SDHCI_INTSIGEN, INT_TC | INT_DATAERR |
                              (reading ? INT_BRR : INT_BWR));
@@ -741,6 +792,8 @@ static int sdhci_cancel(struct sdio_dev_s *dev)
   wr32(priv, SDHCI_INTSIGEN, 0);
   priv->buffer = NULL;
   priv->remaining = 0;
+  priv->piopending = false;
+  priv->tcpending = false;
   priv->waitevents = 0;
   priv->wkupevent = 0;
   leave_critical_section(flags);
@@ -875,25 +928,69 @@ static sdio_eventset_t sdhci_eventwait(struct sdio_dev_s *dev)
   struct am67_sdhci_s *priv = (struct am67_sdhci_s *)dev;
   sdio_eventset_t event;
   irqstate_t flags;
-  int ret;
+  clock_t deadline;
+  clock_t now;
+  bool pio;
+  bool tc;
+  int ret = OK;
 
   /* Always bounded: a missing interrupt must not hang the file system */
 
-  ret = nxsem_tickwait_uninterruptible(&priv->waitsem,
-          MSEC2TICK(priv->waittimeout != 0 ? priv->waittimeout : 1000));
+  deadline = clock_systime_ticks() +
+             MSEC2TICK(priv->waittimeout != 0 ? priv->waittimeout : 1000);
 
-  flags = enter_critical_section();
-  if (ret < 0 && priv->wkupevent == 0)
+  for (; ; )
     {
-      priv->wkupevent = SDIOWAIT_TIMEOUT;
-      priv->waitevents = 0;
-      wr32(priv, SDHCI_INTSIGEN, 0);
-      priv->buffer = NULL;
-      priv->remaining = 0;
-    }
+      flags = enter_critical_section();
+      event = priv->wkupevent;
+      pio = priv->piopending;
+      tc = priv->tcpending;
+      priv->piopending = false;
+      priv->tcpending = false;
 
-  event = priv->wkupevent;
-  leave_critical_section(flags);
+      /* All data is in (reads) or taken by the card (writes) once the
+       * controller reports transfer complete; the block count confirms it.
+       */
+
+      if (event == 0 && tc && !pio)
+        {
+          sdhci_endwait(priv, priv->remaining == 0 ?
+                        SDIOWAIT_TRANSFERDONE : SDIOWAIT_ERROR);
+          event = priv->wkupevent;
+        }
+      else if (tc)
+        {
+          priv->tcpending = true;   /* judge it after this block */
+        }
+
+      if (event == 0 && ret < 0)
+        {
+          priv->wkupevent = SDIOWAIT_TIMEOUT;
+          priv->waitevents = 0;
+          wr32(priv, SDHCI_INTSIGEN, 0);
+          priv->buffer = NULL;
+          priv->remaining = 0;
+          event = SDIOWAIT_TIMEOUT;
+        }
+
+      leave_critical_section(flags);
+
+      if (event != 0)
+        {
+          break;
+        }
+
+      if (pio)
+        {
+          sdhci_pio(priv);
+          continue;
+        }
+
+      now = clock_systime_ticks();
+      ret = now < deadline ?
+            nxsem_tickwait_uninterruptible(&priv->waitsem, deadline - now) :
+            -ETIMEDOUT;
+    }
 
   if ((event & (SDIOWAIT_TIMEOUT | SDIOWAIT_ERROR)) != 0)
     {
