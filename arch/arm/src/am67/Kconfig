@@ -91,6 +91,26 @@ config AM67_MCSPI0_FCLK
 
 endif
 
+config AM67_TICK_TIMER
+	int "MAIN DMTimer instance for the system tick"
+	default 0
+	range 0 2
+	---help---
+		MAIN DMTimer that drives the NuttX system tick (0: 0x02400000,
+		IRQ 24; 1: IRQ 25; 2: 0x02420000, IRQ 26). U-Boot uses DMTimer0
+		as its own tick, so a core that U-Boot starts before Linux must
+		not use 0. The timer is powered through TISCI before use.
+
+config AM67_RPTUN_NET_VDEV
+	bool "Resource table: virtio-net vdev next to RPMsg"
+	default y
+	depends on RPTUN
+	---help---
+		List a virtio-net vdev (for vhost-net) in the resource table.
+		Without it the table holds only the RPMsg vdev, and every entry
+		Linux has to parse lies within the 256 bytes it reads when it
+		attaches to a core that is already running (IPC-only mode).
+
 config AM67_RTI8_WDT
 	bool "AM67 RTI8 watchdog for MAIN R5F core 0 (FIQ motor cut)"
 	default n
