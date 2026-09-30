@@ -20,6 +20,7 @@
 #include <nuttx/mutex.h>
 
 #include "arm_internal.h"
+#include "am67_tisci.h"
 
 /* tisci/tisci.h uses begin_packed, which this NuttX does not define, so the
  * few constants this file needs are repeated here. */
@@ -233,6 +234,46 @@ int am67_tisci_device_on(uint32_t id)
 
   syslog(LOG_INFO, "tisci dev %" PRIu32 " on: ack\n", id);
   return 0;
+}
+
+/* Make sure device `id` stays powered while this core uses it.  A request
+ * of our own makes the DM keep the device on whatever the other hosts do
+ * (Linux or U-Boot releasing it, a runtime-PM suspend).  A device another
+ * host holds exclusively answers NAK; it then works only for as long as
+ * that host keeps it on, which GET_DEVICE confirms for now.
+ *
+ * Returns 0 when this core holds the device, 1 when it is on under another
+ * host's request only, a negated errno when it is off or the DM does not
+ * answer (touching it would then abort).
+ */
+
+int am67_tisci_device_require(uint32_t id)
+{
+  uint8_t programmed = 0;
+  uint8_t current = 0;
+  int ret;
+
+  ret = am67_tisci_device_on(id);
+  if (ret == 0)
+    {
+      return 0;
+    }
+
+  if (am67_tisci_get_device(id, &programmed, &current) < 0)
+    {
+      return ret;
+    }
+
+  if (current == 1)
+    {
+      syslog(LOG_WARNING, "tisci dev %" PRIu32 ": on, held by another "
+             "host\n", id);
+      return 1;
+    }
+
+  syslog(LOG_ERR, "tisci dev %" PRIu32 ": off (programmed %u current %u)\n",
+         id, programmed, current);
+  return -ENODEV;
 }
 
 /* Read the current frequency of clock `clk` of device `dev` (the Linux
