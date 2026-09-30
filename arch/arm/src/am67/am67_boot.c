@@ -58,8 +58,13 @@
 
 #define FW_RSC_ADDR_ANY     (0xffffffffu)
 
-/* Resource table has 2 entries: vdev[0]=RPMsg, vdev[1]=virtio-net */
-#define NO_RESOURCE_ENTRIES (2)
+/* Resource table entries: vdev[0]=RPMsg, vdev[1]=virtio-net (optional) */
+
+#ifdef CONFIG_AM67_RPTUN_NET_VDEV
+#  define NO_RESOURCE_ENTRIES (2)
+#else
+#  define NO_RESOURCE_ENTRIES (1)
+#endif
 #define RSC_VDEV_FEATURE_NS (1) /* Support name service announcement */
 #define RSC_TABLE_VERSION   (1)
 
@@ -108,7 +113,9 @@ const struct am67_rsc_s g_am67_rsc_table =
     .offset =
     {
       offsetof(struct am67_rsc_s, base.rpmsg_vdev),
+#ifdef CONFIG_AM67_RPTUN_NET_VDEV
       offsetof(struct am67_rsc_s, net_vdev),
+#endif
     },
 
     .log_trace =
@@ -155,6 +162,7 @@ const struct am67_rsc_s g_am67_rsc_table =
     }
   },
 
+#ifdef CONFIG_AM67_RPTUN_NET_VDEV
   /* virtio-net vdev entry — Linux creates a virtual Ethernet interface
    * backed by standard virtio_net.ko.  NuttX's virtio-net driver
    * (CONFIG_DRIVERS_VIRTIO_NET) handles the R5F side.
@@ -192,6 +200,7 @@ const struct am67_rsc_s g_am67_rsc_table =
     4,               /* notifyid */
     0                /* pa */
   },
+#endif
 };
 
 /****************************************************************************

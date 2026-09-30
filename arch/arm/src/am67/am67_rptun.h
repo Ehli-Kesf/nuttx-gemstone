@@ -50,9 +50,11 @@
 struct aligned_data(8) am67_rsc_s
 {
   struct rptun_rsc_s       base;        /* RPMsg vdev (index 0) */
+#ifdef CONFIG_AM67_RPTUN_NET_VDEV
   struct fw_rsc_vdev       net_vdev;    /* virtio-net vdev (index 1, id=1) */
   struct fw_rsc_vdev_vring net_vring0;  /* net TX vring */
   struct fw_rsc_vdev_vring net_vring1;  /* net RX vring */
+#endif
 };
 
 /****************************************************************************
