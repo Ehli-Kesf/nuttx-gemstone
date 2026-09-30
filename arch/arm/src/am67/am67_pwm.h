@@ -114,5 +114,11 @@ void am67_epwm_emergency_stop(void);
 
 int am67_epwm_dshot_setup(uint16_t tbprd);
 
+/* Turn back on the time-base clock gates this core enabled if another host
+ * turned them off; returns how often that happened since boot.
+ */
+
+uint32_t am67_epwm_tbclk_guard(void);
+
 #endif /* CONFIG_AM67_EPWM0 || CONFIG_AM67_EPWM1 */
 #endif /* __ARCH_ARM_SRC_AM67_AM67_PWM_H */

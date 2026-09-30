@@ -32,6 +32,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <syslog.h>
 
 #include <nuttx/panic_notifier.h>
 #include <nuttx/timers/pwm.h>
@@ -137,6 +138,13 @@ static int am67_epwm_panic(FAR struct notifier_block *nb,
 /****************************************************************************
  * Private Data
  ****************************************************************************/
+
+/* Time-base clock gates this core turned on, and how often another host
+ * turned one of them off under it (am67_epwm_tbclk_guard()).
+ */
+
+static volatile uint32_t g_tbclk_owned;
+static volatile uint32_t g_tbclk_restores;
 
 static const struct pwm_ops_s g_am67_epwmops =
 {
@@ -300,6 +308,7 @@ static int am67_epwm_enable_clock(uint32_t clken_mask)
       return -EIO;
     }
 
+  g_tbclk_owned |= clken_mask;
   return OK;
 }
 
@@ -321,6 +330,7 @@ static int am67_epwm_disable_clock(uint32_t clken_mask)
   uint32_t regval = am67_epwm_getreg(AM67_MAIN_CTRL_MMR_BASE,
                                      AM67_CTRL_MMR_EPWM_TB_CLKEN);
 
+  g_tbclk_owned &= ~clken_mask;
   regval &= ~clken_mask;
 
   am67_epwm_putreg(AM67_MAIN_CTRL_MMR_BASE, AM67_CTRL_MMR_EPWM_TB_CLKEN,
@@ -1253,6 +1263,58 @@ int am67_epwm_init(void)
  *   Zero (OK) on success; a negated errno value on failure.
  *
  ****************************************************************************/
+
+/****************************************************************************
+ * Name: am67_epwm_tbclk_guard
+ *
+ * Description:
+ *   The time-base clock gates sit in a CTRL_MMR register, outside the
+ *   DM's per-host device accounting, so another host can gate them off
+ *   under a running core.  Linux does at boot ("clk: Disabling unused
+ *   clocks") for every gate it has no consumer of: with this core started
+ *   before Linux that stops the motor outputs.  Turn back on any gate this
+ *   core enabled that is off now.  One register read when nothing changed;
+ *   meant to run every output cycle, from thread context.
+ *
+ * Returned Value:
+ *   How many times a gate had to be turned back on since boot.
+ *
+ ****************************************************************************/
+
+uint32_t am67_epwm_tbclk_guard(void)
+{
+  uint32_t owned = g_tbclk_owned;
+  uint32_t regval;
+  uint32_t n;
+
+  if (owned == 0u)
+    {
+      return g_tbclk_restores;
+    }
+
+  regval = am67_epwm_getreg(AM67_MAIN_CTRL_MMR_BASE,
+                            AM67_CTRL_MMR_EPWM_TB_CLKEN);
+  if ((regval & owned) == owned)
+    {
+      return g_tbclk_restores;
+    }
+
+  /* The partition may have been locked again, too */
+
+  am67_epwm_enable_register_write();
+  am67_epwm_putreg(AM67_MAIN_CTRL_MMR_BASE, AM67_CTRL_MMR_EPWM_TB_CLKEN,
+                   regval | owned);
+
+  n = ++g_tbclk_restores;
+  if ((n & (n - 1u)) == 0u)
+    {
+      syslog(LOG_WARNING, "[pwm] EPWM TB_CLKEN 0x%08" PRIx32 ": gate "
+             "turned off by another host, restored (%" PRIu32 ")\n",
+             regval, n);
+    }
+
+  return n;
+}
 
 int am67_epwm_dshot_setup(uint16_t tbprd)
 {

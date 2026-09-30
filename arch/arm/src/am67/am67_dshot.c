@@ -367,6 +367,8 @@ int am67_dshot_trigger(void)
       return -EAGAIN;
     }
 
+  (void)am67_epwm_tbclk_guard();
+
   if (g_am67_dshot.busy)
     {
       g_overruns++;
