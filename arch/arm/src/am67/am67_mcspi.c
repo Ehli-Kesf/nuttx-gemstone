@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -43,6 +44,7 @@
 
 #include "am67_mcspi.h"
 #include "am67_pinmux.h"
+#include "am67_tisci.h"
 #include "arm.h"
 #include "arm_internal.h"
 #include "sctlr.h"
@@ -1011,12 +1013,28 @@ static void am67_mcspi_exchange(FAR struct spi_dev_s *dev,
 }
 #endif
 
+/* MCU_MCSPI0 answered as powered; until then no register is touched */
+
+static bool g_spi0_powered;
+
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
 
 void am67_spiinitialize(void)
 {
+  /* Nobody else powers MCU_MCSPI0 once Linux leaves it alone; the IMU and
+   * the barometer are behind it.
+   */
+
+  if (am67_tisci_device_require(AM67_TISCI_DEV_MCU_MCSPI0) < 0)
+    {
+      spierr("MCU_MCSPI0 is not powered\n");
+      return;
+    }
+
+  g_spi0_powered = true;
+
   /* Controller first: the chip-selects must be parked inactive before
    * the pads are handed to MCSPI.
    */
@@ -1038,7 +1056,7 @@ void am67_spiinitialize(void)
 
 FAR struct spi_dev_s *am67_spibus_initialize(int port)
 {
-  if (port != 0)
+  if (port != 0 || !g_spi0_powered)
     {
       return NULL;
     }

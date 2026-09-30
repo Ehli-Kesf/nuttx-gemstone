@@ -33,13 +33,13 @@
 #endif
 
 #include "arm_internal.h"
+#include "am67_tisci.h"
 
 /****************************************************************************
  * Pre-processor definitions
  ****************************************************************************/
 
 #define AM67_UART_MDR1_OFFSET  0x20   /* MDR1: 0 = UART 16x, 7 = disabled */
-#define AM67_TISCI_DEV_UART6   158u   /* J722S TISCI device ID, MAIN_UART6 */
 
 #if defined(USE_SERIALDRIVER) /* && defined(HAVE_UART_DEVICE)*/
 
@@ -77,7 +77,6 @@ static void open_uart(void)
  ****************************************************************************/
 
 #ifdef CONFIG_16550_UART1
-int am67_tisci_device_on(uint32_t id);
 
 /****************************************************************************
  * Name: am67_uart6_enable
@@ -92,7 +91,7 @@ int am67_tisci_device_on(uint32_t id);
 
 int am67_uart6_enable(void)
 {
-  int ret = am67_tisci_device_on(AM67_TISCI_DEV_UART6);
+  int ret = am67_tisci_device_require(AM67_TISCI_DEV_MAIN_UART6);
 
   if (ret < 0)
     {
@@ -115,6 +114,14 @@ int am67_uart6_enable(void)
 
 void arm_serialinit(void)
 {
+#if CONFIG_16550_UART0_BASE == 0x2810000
+  /* MAIN_UART1: powered by nobody else once Linux leaves it alone (the
+   * px4-r5f overlay disables it), and touching an unpowered UART aborts.
+   */
+
+  (void)am67_tisci_device_require(AM67_TISCI_DEV_MAIN_UART1);
+#endif
+
   u16550_earlyserialinit();
   u16550_serialinit();
   open_uart();
