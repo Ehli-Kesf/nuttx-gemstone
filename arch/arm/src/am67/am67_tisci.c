@@ -237,13 +237,15 @@ int am67_tisci_device_on(uint32_t id)
   return 0;
 }
 
-/* Ask the DM to reset the whole SoC (as Linux reboot does): with the R5F
- * started by U-Boot, a PX4 reboot then no longer needs Linux.  Returns
- * only if the DM refused (-EIO) or did not answer; on success the SoC,
- * this core included, is reset before or right after the ACK.
+/* Ask the DM to reset the whole SoC (as Linux reboot does): the R5F needs
+ * nobody else to restart.  am67_tisci_sys_reset_now() takes no lock and
+ * logs nothing, for a crash or watchdog handler with interrupts off: a
+ * request another context left half-written in the proxy thread can only
+ * make the DM refuse this one.  Both return only if the DM refused (-EIO)
+ * or did not answer; on success the SoC, this core included, resets.
  */
 
-int am67_tisci_sys_reset(void)
+static int sys_reset_xfer(uint8_t seq)
 {
   uint16_t type = TISCI_MSG_SYS_RESET;
   uint32_t flags = TISCI_MSG_FLAG_AOP;
@@ -253,6 +255,29 @@ int am67_tisci_sys_reset(void)
 
   memset(req, 0, sizeof(req));
   memset(resp, 0, sizeof(resp));
+  memcpy(req + 0, &type, 2);
+  req[2] = TISCI_HOST_ID_MAIN_0_R5_1;
+  req[3] = seq;
+  memcpy(req + 4, &flags, 4);
+
+  ret = sproxy_xfer(req, sizeof(req), resp, sizeof(resp));
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  memcpy(&flags, resp + 4, 4);
+  return (flags & TISCI_MSG_FLAG_ACK) ? 0 : -EIO;
+}
+
+int am67_tisci_sys_reset_now(void)
+{
+  return sys_reset_xfer(g_seq++);
+}
+
+int am67_tisci_sys_reset(void)
+{
+  int ret;
 
   ret = nxmutex_lock(&g_lock);
   if (ret < 0)
@@ -260,24 +285,11 @@ int am67_tisci_sys_reset(void)
       return ret;
     }
 
-  memcpy(req + 0, &type, 2);
-  req[2] = TISCI_HOST_ID_MAIN_0_R5_1;
-  req[3] = g_seq++;
-  memcpy(req + 4, &flags, 4);
-
-  ret = sproxy_xfer(req, sizeof(req), resp, sizeof(resp));
+  ret = sys_reset_xfer(g_seq++);
   nxmutex_unlock(&g_lock);
 
-  if (ret < 0)
-    {
-      syslog(LOG_ERR, "tisci sys reset: xfer %d\n", ret);
-      return ret;
-    }
-
-  memcpy(&flags, resp + 4, 4);
-  syslog(LOG_ERR, "tisci sys reset: %s flags 0x%" PRIx32 "\n",
-         (flags & TISCI_MSG_FLAG_ACK) ? "ack" : "nak", flags);
-  return (flags & TISCI_MSG_FLAG_ACK) ? 0 : -EIO;
+  syslog(LOG_ERR, "tisci sys reset refused or unanswered: %d\n", ret);
+  return ret;
 }
 
 /* Make sure device `id` stays powered while this core uses it.  A request

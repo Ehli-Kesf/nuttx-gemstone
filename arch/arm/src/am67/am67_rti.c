@@ -41,7 +41,9 @@
 #include <nuttx/config.h>
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdint.h>
+#include <syslog.h>
 
 #include <nuttx/arch.h>
 #include <nuttx/cache.h>
@@ -49,6 +51,7 @@
 
 #include "arm_internal.h"
 #include "am67_rti.h"
+#include "am67_tisci.h"
 
 #if defined(CONFIG_AM67_EPWM0) || defined(CONFIG_AM67_EPWM1)
 #  include "am67_pwm.h"
@@ -113,8 +116,13 @@
  * core never evicts the cache line.
  */
 
+#ifdef CONFIG_AM67_RESET_ON_FATAL
+volatile uint32_t g_am67_wdt_fiq_info[AM67_WDT_INFO_WORDS]
+  aligned_data(32) locate_data(".am67_noinit");
+#else
 volatile uint32_t g_am67_wdt_fiq_info[AM67_WDT_INFO_WORDS]
   aligned_data(32);
+#endif
 
 void am67_wdt_info_set(int index, uint32_t value)
 {
@@ -131,6 +139,22 @@ void am67_wdt_info_set(int index, uint32_t value)
 int am67_rti_wdt_start(uint32_t timeout_ms)
 {
   uint32_t prld;
+
+#ifdef CONFIG_AM67_RESET_ON_FATAL
+  /* The record survives the SoC reset that followed the expiry */
+
+  if (g_am67_wdt_fiq_info[0] == AM67_WDT_INFO_MAGIC)
+    {
+      syslog(LOG_ERR, "[wdt] previous run ended in a watchdog expiry: "
+             "pc 0x%08" PRIx32 " lr 0x%08" PRIx32 " cpsr 0x%08" PRIx32
+             " sp 0x%08" PRIx32 " vim 0x%08" PRIx32 "\n",
+             g_am67_wdt_fiq_info[1], g_am67_wdt_fiq_info[2],
+             g_am67_wdt_fiq_info[3], g_am67_wdt_fiq_info[4],
+             g_am67_wdt_fiq_info[5]);
+    }
+
+  am67_wdt_info_set(0, 0);
+#endif
 
   if ((getreg32(WWD8_CLKSEL) & WWD8_CLKSEL_MASK) != 0)
     {
@@ -234,6 +258,15 @@ uint32_t *arm_decodefiq(uint32_t *regs)
   am67_wdt_info_set(4, regs[REG_SP]);
   am67_wdt_info_set(5, act);
   am67_wdt_info_set(0, AM67_WDT_INFO_MAGIC);
+
+#ifdef CONFIG_AM67_RESET_ON_FATAL
+  /* Restart through U-Boot without waiting for anyone: the log and the
+   * record above must reach DDR first.
+   */
+
+  up_flush_dcache_all();
+  (void)am67_tisci_sys_reset_now();
+#endif
 
   /* Stay here with every interrupt source disabled at the VIM.  The core
    * does not answer the remoteproc mailbox any more: `echo stop` times out
