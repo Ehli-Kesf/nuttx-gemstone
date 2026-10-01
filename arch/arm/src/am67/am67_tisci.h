@@ -47,5 +47,6 @@ int am67_tisci_device_require(uint32_t id);
 int am67_tisci_get_device(uint32_t id, uint8_t *programmed,
                           uint8_t *current);
 int am67_tisci_get_freq(uint32_t dev, uint8_t clk, uint64_t *hz);
+int am67_tisci_sys_reset(void);
 
 #endif /* __ARCH_ARM_SRC_AM67_AM67_TISCI_H */

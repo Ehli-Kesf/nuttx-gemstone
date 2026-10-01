@@ -25,6 +25,7 @@
 /* tisci/tisci.h uses begin_packed, which this NuttX does not define, so the
  * few constants this file needs are repeated here. */
 
+#define TISCI_MSG_SYS_RESET                      0x0005u
 #define TISCI_MSG_SET_DEVICE                     0x0200u
 #define TISCI_MSG_GET_FREQ                       0x010eu
 #define TISCI_MSG_GET_DEVICE                     0x0201u
@@ -234,6 +235,49 @@ int am67_tisci_device_on(uint32_t id)
 
   syslog(LOG_INFO, "tisci dev %" PRIu32 " on: ack\n", id);
   return 0;
+}
+
+/* Ask the DM to reset the whole SoC (as Linux reboot does): with the R5F
+ * started by U-Boot, a PX4 reboot then no longer needs Linux.  Returns
+ * only if the DM refused (-EIO) or did not answer; on success the SoC,
+ * this core included, is reset before or right after the ACK.
+ */
+
+int am67_tisci_sys_reset(void)
+{
+  uint16_t type = TISCI_MSG_SYS_RESET;
+  uint32_t flags = TISCI_MSG_FLAG_AOP;
+  uint8_t req[8];
+  uint8_t resp[8];
+  int ret;
+
+  memset(req, 0, sizeof(req));
+  memset(resp, 0, sizeof(resp));
+
+  ret = nxmutex_lock(&g_lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  memcpy(req + 0, &type, 2);
+  req[2] = TISCI_HOST_ID_MAIN_0_R5_1;
+  req[3] = g_seq++;
+  memcpy(req + 4, &flags, 4);
+
+  ret = sproxy_xfer(req, sizeof(req), resp, sizeof(resp));
+  nxmutex_unlock(&g_lock);
+
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "tisci sys reset: xfer %d\n", ret);
+      return ret;
+    }
+
+  memcpy(&flags, resp + 4, 4);
+  syslog(LOG_ERR, "tisci sys reset: %s flags 0x%" PRIx32 "\n",
+         (flags & TISCI_MSG_FLAG_ACK) ? "ack" : "nak", flags);
+  return (flags & TISCI_MSG_FLAG_ACK) ? 0 : -EIO;
 }
 
 /* Make sure device `id` stays powered while this core uses it.  A request
