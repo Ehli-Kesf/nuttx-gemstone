@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <syslog.h>
 #include <stdbool.h>
 #include <assert.h>
 #include <errno.h>
@@ -253,6 +254,8 @@ static int am67_i2c_isr_process(struct am67_i2c_priv_s *priv);
 static int am67_i2c_isr(int irq, void *context, void *arg);
 #endif /* !CONFIG_I2C_POLLED */
 
+static bool am67_i2c_bus_recover(struct am67_i2c_priv_s *priv);
+static int am67_i2c_hwinit(struct am67_i2c_priv_s *priv);
 static int am67_i2c_init(struct am67_i2c_priv_s *priv);
 int am67_tisci_device_on(uint32_t id);
 static int am67_i2c_deinit(struct am67_i2c_priv_s *priv);
@@ -1120,7 +1123,73 @@ static int am67_i2c_isr(int irq, void *context, void *arg)
  *
  ****************************************************************************/
 
-static int am67_i2c_init(struct am67_i2c_priv_s *priv)
+/****************************************************************************
+ * Name: am67_i2c_bus_recover
+ *
+ * Description:
+ *   A slave that lost a transfer half way keeps driving SDA low, and the
+ *   bus stays busy until that slave is powered down: every transfer then
+ *   times out.  On the O1 this happens when Linux reboots the SoC while
+ *   the R5F reads the compass (the GPS module stays powered), and could
+ *   happen after a glitch on the wires.  Clock the slave out: up to nine
+ *   SCL pulses until it releases SDA, then a STOP (I2C-bus specification
+ *   3.1.16), through the SYSTEST I/O mode as Linux omap-i2c does.  Call
+ *   with the controller enabled and idle.
+ *
+ * Returned Value:
+ *   true if SDA was held low (and a recovery was attempted).
+ *
+ ****************************************************************************/
+
+static bool am67_i2c_bus_recover(struct am67_i2c_priv_s *priv)
+{
+  uint32_t st = am67_i2c_getreg(priv, AM67_I2C_SYSTEST_OFFSET);
+  uint32_t io;
+  int clocks;
+
+  if ((st & I2C_SYSTEST_SDA_I_FUNC) != 0)
+    {
+      return false;
+    }
+
+  io = (st & ~I2C_SYSTEST_TMODE_MASK) | I2C_SYSTEST_ST_EN |
+       I2C_SYSTEST_TMODE_LOOPBACK;
+  am67_i2c_putreg(priv, AM67_I2C_SYSTEST_OFFSET,
+                  io | I2C_SYSTEST_SCL_O | I2C_SYSTEST_SDA_O);
+  up_udelay(10);
+
+  for (clocks = 0; clocks < 9 &&
+       (am67_i2c_getreg(priv, AM67_I2C_SYSTEST_OFFSET) &
+        I2C_SYSTEST_SDA_I_FUNC) == 0; clocks++)
+    {
+      am67_i2c_putreg(priv, AM67_I2C_SYSTEST_OFFSET,
+                      io | I2C_SYSTEST_SDA_O);
+      up_udelay(5);
+      am67_i2c_putreg(priv, AM67_I2C_SYSTEST_OFFSET,
+                      io | I2C_SYSTEST_SCL_O | I2C_SYSTEST_SDA_O);
+      up_udelay(5);
+    }
+
+  /* Try a STOP (SDA rising while SCL is high); the controller may not
+   * drive SDA in this mode, am67_i2c_init() resets it afterwards anyway.
+   */
+
+  am67_i2c_putreg(priv, AM67_I2C_SYSTEST_OFFSET, io | I2C_SYSTEST_SCL_O);
+  up_udelay(5);
+  am67_i2c_putreg(priv, AM67_I2C_SYSTEST_OFFSET,
+                  io | I2C_SYSTEST_SCL_O | I2C_SYSTEST_SDA_O);
+  up_udelay(5);
+  am67_i2c_putreg(priv, AM67_I2C_SYSTEST_OFFSET,
+                  st & ~(I2C_SYSTEST_ST_EN | I2C_SYSTEST_TMODE_MASK));
+
+  syslog(LOG_WARNING, "[i2c] 0x%08" PRIx32 ": SDA held low, %d clock(s), "
+         "bus %s\n", priv->config->base, clocks,
+         (am67_i2c_getreg(priv, AM67_I2C_SYSTEST_OFFSET) &
+          I2C_SYSTEST_SDA_I_FUNC) != 0 ? "free" : "still stuck");
+  return true;
+}
+
+static int am67_i2c_hwinit(struct am67_i2c_priv_s *priv)
 {
   unsigned int spins;
 
@@ -1207,6 +1276,31 @@ static int am67_i2c_init(struct am67_i2c_priv_s *priv)
 }
 
 /****************************************************************************
+ * Name: am67_i2c_init
+ *
+ * Description:
+ *   Bring the controller up.  Every (re)initialisation runs after a boot or
+ *   a failed transfer: free a bus that a slave is still holding.  Clocking
+ *   the slave out releases SDA, but no STOP appears on the bus (SYSTEST
+ *   cannot drive SDA here), so the controller keeps its bus-busy flag:
+ *   reset it once more.  The next transfer's START then ends what the
+ *   slave was in the middle of.
+ *
+ ****************************************************************************/
+
+static int am67_i2c_init(struct am67_i2c_priv_s *priv)
+{
+  int ret = am67_i2c_hwinit(priv);
+
+  if (ret == OK && am67_i2c_bus_recover(priv))
+    {
+      ret = am67_i2c_hwinit(priv);
+    }
+
+  return ret;
+}
+
+/****************************************************************************
  * Name: am67_i2c_deinit
  *
  * Description:
@@ -1250,6 +1344,7 @@ static int am67_i2c_transfer(struct i2c_master_s *dev,
                                struct i2c_msg_s *msgs, int count)
 {
   struct am67_i2c_priv_s *priv = (struct am67_i2c_priv_s *)dev;
+  bool stopped;
   int ret;
 
   DEBUGASSERT(count > 0);
@@ -1280,10 +1375,19 @@ static int am67_i2c_transfer(struct i2c_master_s *dev,
       priv->inited = true;
     }
 
-  /* Wait for any STOP in progress */
+  /* Wait for any STOP in progress.  A bus that a slave still holds stays
+   * busy: reinitialise, which frees it (am67_i2c_bus_recover()), and wait
+   * once more instead of failing this transfer too.
+   */
 
   ret = -EBUSY;
-  if (am67_i2c_sem_waitstop(priv))
+  stopped = am67_i2c_sem_waitstop(priv);
+  if (!stopped && am67_i2c_init(priv) == OK)
+    {
+      stopped = am67_i2c_sem_waitstop(priv);
+    }
+
+  if (stopped)
     {
       /* Clear TX and RX FIFOs before each transfer.  Stale FIFO data from
        * the previous transfer can cause XRDY/RRDY to fire at unexpected
