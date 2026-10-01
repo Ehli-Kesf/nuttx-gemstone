@@ -155,6 +155,7 @@ static bool am67_rptun_is_master(struct rptun_dev_s *dev);
 static int am67_rptun_start(struct rptun_dev_s *dev);
 static int am67_rptun_stop(struct rptun_dev_s *dev);
 static int am67_rptun_notify(struct rptun_dev_s *dev, uint32_t vqid);
+static void am67_rptun_panic(struct rptun_dev_s *dev);
 static int am67_rptun_register_callback(struct rptun_dev_s *dev,
                                         rptun_callback_t callback,
                                         void *arg);
@@ -176,6 +177,7 @@ static const struct rptun_ops_s g_am67_rptun_ops =
   .stop              = am67_rptun_stop,
   .notify            = am67_rptun_notify,
   .register_callback = am67_rptun_register_callback,
+  .panic             = am67_rptun_panic,
 };
 
 static struct am67_rptun_dev_s g_am67_rptun_dev;
@@ -271,6 +273,18 @@ static int am67_rptun_notify(struct rptun_dev_s *dev, uint32_t vqid)
   putreg32(vqid, AM67_MBOX_MESSAGE(AM67_MBOX_TX_FIFO));
   UP_DSB();
   return 0;
+}
+
+/* A panic must not wait for Linux.  Without this op rptun_dev_panic() sends
+ * RPTUN_CMD_PANIC through the resource table and polls up to
+ * CONFIG_RPTUN_CMD_TIMEOUT_MS (5 s) for an ACK that Linux remoteproc never
+ * gives; the watchdog fired first.  Tell nobody: the log survives in DDR
+ * and the board code resets the SoC.
+ */
+
+static void am67_rptun_panic(struct rptun_dev_s *dev)
+{
+  UNUSED(dev);
 }
 
 static int am67_rptun_register_callback(struct rptun_dev_s *dev,
