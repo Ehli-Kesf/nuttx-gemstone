@@ -91,6 +91,18 @@ config AM67_MCSPI0_FCLK
 
 endif
 
+config AM67_DDR_READ_ORDERID
+	int "MAIN R5F DDR read order ID (QoS)"
+	default 0
+	range 0 15
+	---help---
+		Order ID of this core's reads in its QoS endpoint
+		(PULSAR_UL_MAIN_0_CPU0_RMST channel 0); 0 keeps the reset value.
+		Order IDs 8-15 take the DDR controller's high-priority path, as
+		U-Boot sets for the display (15). With Linux loading DDR on all
+		four A53 cores, 15 gave the PX4 core 2.7 points more idle time
+		and about 12 us less control latency on the T3 Gemstone O1.
+
 config AM67_TICK_TIMER
 	int "MAIN DMTimer instance for the system tick"
 	default 0

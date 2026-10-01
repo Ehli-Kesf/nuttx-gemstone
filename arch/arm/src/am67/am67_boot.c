@@ -33,6 +33,7 @@
 #include "am67_pinmux.h"
 #include "am67_rptun.h"
 #include "arm.h"
+#include "arm_internal.h"
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -57,6 +58,14 @@
  */
 
 #define FW_RSC_ADDR_ANY     (0xffffffffu)
+
+/* QoS endpoint of the MAIN R5F reads (K3 QoS: base + 0x100 + 4 * channel;
+ * u-boot arch/arm/mach-k3/r5/j722s/j722s_qos.h)
+ */
+
+#define AM67_QOS_MAIN_R5F_RMST_CH0  (0x45d15000u + 0x100u)
+#define AM67_QOS_ORDERID_SHIFT      (4)
+#define AM67_QOS_ORDERID_MASK       (0xfu << AM67_QOS_ORDERID_SHIFT)
 
 /* Resource table entries: vdev[0]=RPMsg, vdev[1]=virtio-net (optional) */
 
@@ -261,6 +270,16 @@ void arm_boot(void)
   /* Do pinmux to get UART early */
 
   am67_pinmux_init();
+
+#if CONFIG_AM67_DDR_READ_ORDERID != 0
+  /* Put this core's DDR reads on the high-priority path, so that a busy
+   * A53 delays the flight code less (CONFIG_AM67_DDR_READ_ORDERID).
+   */
+
+  modifyreg32(AM67_QOS_MAIN_R5F_RMST_CH0, AM67_QOS_ORDERID_MASK,
+              (uint32_t)CONFIG_AM67_DDR_READ_ORDERID <<
+              AM67_QOS_ORDERID_SHIFT);
+#endif
 
   /* Then start NuttX */
 
